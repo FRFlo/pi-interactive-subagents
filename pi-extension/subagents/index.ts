@@ -1662,6 +1662,67 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
 
   // ── subagent_message tool ──
+  // ── subagent_read tool ──
+  // Native sessions do not expose a terminal pane.  Provide an explicit
+  // transcript reader so the parent model never falls back to bash_output or
+  // tries to inspect an obsolete multiplexer surface.
+  pi.registerTool({
+      name: "subagent_read",
+      label: "Read Subagent",
+      description:
+        "Read the latest persisted result from a subagent by name. " +
+        "Use this for consultation/status checks instead of bash_output, terminal polling, or reading session files manually. " +
+        "It is safe for running and finished native sessions; it does not steer or resume the subagent.",
+      parameters: Type.Object({
+        name: Type.String({ description: "Exact display name of the subagent to consult." }),
+      }),
+      renderCall(args, theme) {
+        return new Text(
+          "○ " + theme.fg("toolTitle", theme.bold(args.name ?? "(unknown)")) + theme.fg("dim", " — read"),
+          0,
+          0,
+        );
+      },
+      renderResult(result, _opts, theme) {
+        const text = typeof result.content[0]?.text === "string" ? result.content[0].text : "";
+        return new Text(theme.fg("dim", text), 0, 0);
+      },
+      async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+        const requestedName = params.name?.trim();
+        if (!requestedName) {
+          return { content: [{ type: "text" as const, text: "Provide the subagent's `name` to read." }] };
+        }
+
+        const running = Array.from(runningSubagents.values()).find((r) => r.name === requestedName);
+        const parentArtifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), ctx.sessionManager.getSessionId());
+        const entry = running
+          ? { sessionFile: running.sessionFile }
+          : resolveNameInRegistry(parentArtifactDir, requestedName);
+        if (!entry?.sessionFile || !existsSync(entry.sessionFile)) {
+          const known = Object.keys(readNameRegistry(parentArtifactDir));
+          return {
+            content: [{
+              type: "text" as const,
+              text: `No readable subagent named "${requestedName}".${known.length ? ` Known names: ${known.join(", ")}.` : ""}`,
+            }],
+            details: { error: "unknown subagent", name: requestedName },
+          };
+        }
+
+        const entries = getNewEntries(entry.sessionFile, 0);
+        const latest = findLastAssistantMessage(entries);
+        const status = running ? (running.native?.session as any)?.isStreaming ? "active" : "waiting" : "finished";
+        const text = latest
+          ? `Subagent "${requestedName}" (${status}):\n\n${latest}`
+          : `Subagent "${requestedName}" is ${status}; no assistant result is persisted yet.`;
+        return {
+          content: [{ type: "text" as const, text }],
+          details: { name: requestedName, status, sessionFile: entry.sessionFile, latest },
+        };
+      },
+    });
+
+  // ── subagent_message tool ──
   pi.registerTool({
       name: "subagent_message",
       label: "Message Subagent",
