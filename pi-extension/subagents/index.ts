@@ -1819,7 +1819,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         });
         return {
           content: [{ type: "text", text: `Session "${name}" resumed.` }],
-          details: { id: nativeRunning.id, name, sessionFile, status: "started" },
+          details: { id: nativeRunning.id, name, sessionFile: sessionPath, status: "started" },
         };
       },
     });
