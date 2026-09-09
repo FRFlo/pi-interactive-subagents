@@ -3,10 +3,10 @@ import {
   DefaultResourceLoader,
   SessionManager,
   SettingsManager,
-  createCodingTools,
   type AgentSession,
   type ExtensionFactory,
 } from "@mariozechner/pi-coding-agent";
+import * as PiCodingAgent from "@mariozechner/pi-coding-agent";
 
 export interface NativeSubagentOptions {
   cwd: string;
@@ -55,6 +55,14 @@ export async function createNativeSubagent(options: NativeSubagentOptions): Prom
   });
   await resourceLoader.reload();
 
+  // Older pi SDKs expect instantiated tool objects; current pi SDKs expect
+  // tool names. Support both because the extension can be loaded by either
+  // the bundled runtime or the standalone package test dependencies.
+  const legacyCodingTools = (PiCodingAgent as any).codingTools as any[] | undefined;
+  const selectedTools = legacyCodingTools
+    ? legacyCodingTools.filter((tool) => options.tools!.includes(tool.name))
+    : options.tools;
+
   const { session } = await createAgentSession({
     cwd: options.cwd,
     agentDir: options.agentDir,
@@ -62,9 +70,7 @@ export async function createNativeSubagent(options: NativeSubagentOptions): Prom
     settingsManager,
     resourceLoader,
     model: options.model,
-    tools: options.tools
-      ? createCodingTools(options.cwd).filter((tool) => options.tools!.includes(tool.name))
-      : undefined,
+    tools: options.tools ? selectedTools : undefined,
   } as any);
 
   return {
