@@ -84,6 +84,76 @@ npm run test:e2e:real
 
 That smoke test is skipped unless `PI_E2E_REAL_MODEL=1` is set by the script.
 
+### Provider credentials
+
+Pi accepts provider credentials either through environment variables or through
+`~/.pi/agent/auth.json`. Never commit API keys to the repository.
+
+Common API-key providers:
+
+| Provider | Environment variable |
+| --- | --- |
+| OpenRouter | `OPENROUTER_API_KEY` |
+| OpenAI | `OPENAI_API_KEY` |
+| Anthropic | `ANTHROPIC_API_KEY` |
+| Google Gemini | `GEMINI_API_KEY` |
+| Mistral | `MISTRAL_API_KEY` |
+
+Set a key before starting Pi. For Bash or Git Bash:
+
+```bash
+export OPENROUTER_API_KEY="sk-or-v1-..."
+pi
+```
+
+For PowerShell:
+
+```powershell
+$env:OPENROUTER_API_KEY = "sk-or-v1-..."
+pi
+```
+
+Alternatively, authenticate interactively with `/login` when the provider
+supports OAuth. API keys can also be stored in `~/.pi/agent/auth.json`:
+
+```json
+{
+  "openrouter": { "type": "api_key", "key": "sk-or-v1-..." }
+}
+```
+
+The real-provider smoke test also needs a configured default model. Point
+`PI_CODING_AGENT_DIR` at the Pi configuration directory containing your
+`auth.json` and model/settings configuration. For example, with OpenRouter:
+
+```bash
+export OPENROUTER_API_KEY="sk-or-v1-..."
+export PI_CODING_AGENT_DIR="$HOME/.pi/agent"
+npm run test:e2e:real
+```
+
+PowerShell:
+
+```powershell
+$env:OPENROUTER_API_KEY = "sk-or-v1-..."
+$env:PI_CODING_AGENT_DIR = "$HOME/.pi/agent"
+npm run test:e2e:real
+```
+
+The test reads the default provider/model from that configuration directory.
+If no model is configured, the SDK reports `provider: unknown`; start Pi,
+select a model with `/model`, and retry. To verify only the deterministic
+tests (without credentials or network access), run:
+
+```bash
+npm test
+npm run test:integration
+npm run test:e2e
+```
+
+The complete provider list and cloud-provider setup are documented in Pi's
+[provider guide](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/docs/providers.md).
+
 ## Bundled agents
 
 | Agent | Model | Tools | Role |
