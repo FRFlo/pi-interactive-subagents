@@ -64,6 +64,26 @@ A sub-agent can ask its orchestrator a single freeform question when requirement
 
 If the reply arrives while the sub-agent is still mid-turn, it is absorbed into the current turn — either way the question is marked answered and the session exits normally when the work is done. If the parent never replies, the session stays open until it is resumed. Only available inside sub-agent sessions.
 
+## Test suite
+
+The project uses Bun. The deterministic suite runs without network access:
+
+```bash
+npm test
+npm run test:integration
+npm run test:e2e
+```
+
+The native orchestration E2E tests use Pi's faux provider and cover persistent
+transcripts, tool allowlists, parallel sessions, and resume behavior. An
+optional real-provider smoke test is available when credentials are configured:
+
+```bash
+npm run test:e2e:real
+```
+
+That smoke test is skipped unless `PI_E2E_REAL_MODEL=1` is set by the script.
+
 ## Bundled agents
 
 | Agent | Model | Tools | Role |
