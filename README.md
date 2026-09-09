@@ -23,6 +23,8 @@ Use `/subagent-focus <name>` to route editor input to a child, `/subagent-focus 
 | --- | --- |
 | `subagent` | Spawn a native pi sub-agent (async) |
 | `subagent_message` | Message a sub-agent by name — steers it if running, resumes its session if finished |
+| `subagent_list` | List spawned sub-agent sessions and their latest persisted result |
+| `subagent_read` | Read the latest persisted result from one spawned sub-agent |
 | `subagents_list` | List available agent definitions |
 | `ask_question` | *(sub-agent sessions only)* Ask the orchestrator a question and wait for the reply |
 

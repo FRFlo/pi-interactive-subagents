@@ -1661,6 +1661,42 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
 
 
+  // ── subagent_list tool ──
+  // `subagents_list` lists available agent definitions; this tool lists the
+  // actual sessions belonging to the current parent conversation.
+  pi.registerTool({
+      name: "subagent_list",
+      label: "List Subagents",
+      description:
+        "List subagent sessions spawned by this conversation, including running/finished status and the latest persisted result. " +
+        "Use this instead of subagents_list when you need to consult spawned sessions; do not use bash_output or terminal polling.",
+      parameters: Type.Object({}),
+      renderCall(_args, theme) {
+        return new Text("○ " + theme.fg("toolTitle", theme.bold("subagents")) + theme.fg("dim", " — list sessions"), 0, 0);
+      },
+      renderResult(result, _opts, theme) {
+        const text = typeof result.content[0]?.text === "string" ? result.content[0].text : "";
+        return new Text(theme.fg("dim", text), 0, 0);
+      },
+      async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
+        const parentArtifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), ctx.sessionManager.getSessionId());
+        const registry = readNameRegistry(parentArtifactDir);
+        const rows = Object.entries(registry).map(([name, entry]) => {
+          const running = Array.from(runningSubagents.values()).find((candidate) =>
+            candidate.name === name || resolve(candidate.sessionFile) === resolve(entry.sessionFile));
+          const exists = existsSync(entry.sessionFile);
+          const status = running
+            ? ((running.native?.session as any)?.isStreaming ? "active" : "waiting")
+            : exists ? "finished" : "missing";
+          const latest = exists ? findLastAssistantMessage(getNewEntries(entry.sessionFile, 0)) : null;
+          const sessionId = exists ? getSessionId(entry.sessionFile) : entry.sessionId;
+          return `• ${name} [${status}]${sessionId ? ` (${sessionId})` : ""}${latest ? `\n  ${latest.replace(/\s+/g, " ")}` : ""}`;
+        });
+        const text = rows.length ? rows.join("\n") : "No subagent sessions in this conversation.";
+        return { content: [{ type: "text" as const, text }], details: { sessions: rows } };
+      },
+    });
+
   // ── subagent_message tool ──
   // ── subagent_read tool ──
   // Native sessions do not expose a terminal pane.  Provide an explicit

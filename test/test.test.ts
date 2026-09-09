@@ -1983,6 +1983,7 @@ describe("subagent interruption", () => {
     const names = registeredTools.map((tool) => tool.name);
     assert.equal(names.includes("subagent_message"), true);
     assert.equal(names.includes("subagent_read"), true);
+    assert.equal(names.includes("subagent_list"), true);
     assert.equal(names.includes("subagent_interrupt"), false);
     assert.equal(names.includes("subagent_resume"), false);
   });
