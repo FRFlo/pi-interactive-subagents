@@ -2070,6 +2070,37 @@ describe("subagent interruption", () => {
     }
   });
 
+  it("focus switches the visible session and returns to the parent", async () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    runningMap.clear();
+    runningMap.set("focus-1", makeRunning({
+      id: "focus-1",
+      name: "Worker",
+      sessionFile: "C:/sessions/worker.jsonl",
+    }));
+    const switchedTo: string[] = [];
+    try {
+      const { api, registeredCommands } = createMockExtensionApi();
+      (subagentsModule as any).default(api);
+      const command = registeredCommands.find((candidate) => candidate.name === "subagent-focus");
+      const ctx = {
+        sessionManager: { getSessionFile: () => "C:/sessions/parent.jsonl" },
+        ui: { notify() {} },
+        switchSession: async (sessionFile: string) => {
+          switchedTo.push(sessionFile);
+          return { cancelled: false };
+        },
+      } as any;
+      await command.handler("Worker", ctx);
+      assert.deepEqual(switchedTo, ["C:/sessions/worker.jsonl"]);
+      await command.handler("parent", ctx);
+      assert.deepEqual(switchedTo, ["C:/sessions/worker.jsonl", "C:/sessions/parent.jsonl"]);
+    } finally {
+      runningMap.clear();
+    }
+  });
+
   it("reads transcript, loadout, and structured diagnostics for a finished session", async () => {
     const dir = createTestDir();
     const sessionId = "parent-id";

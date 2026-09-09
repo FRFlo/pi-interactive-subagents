@@ -604,6 +604,8 @@ interface RunningSubagent {
 /** All currently running subagents, keyed by id. */
 const runningSubagents = new Map<string, RunningSubagent>();
 let focusedSubagentId: string | null = null;
+let focusedParentSessionFile: string | null = null;
+let switchFocusedSession: ((sessionFile: string) => Promise<{ cancelled: boolean }>) | null = null;
 
 // When this extension is loaded inside a subagent that itself spawns children
 // (e.g. a worker delegating to scout/researcher), `subagent-done.ts` runs in the
@@ -1333,6 +1335,17 @@ async function watchSubagent(
       runningSubagents.delete(running.id);
       if (focusedSubagentId === running.id) {
         focusedSubagentId = null;
+        const parentSessionFile = focusedParentSessionFile;
+        const switchSession = switchFocusedSession;
+        if (parentSessionFile && switchSession) {
+          void switchSession(parentSessionFile).finally(() => {
+            if (focusedParentSessionFile === parentSessionFile) focusedParentSessionFile = null;
+            if (switchFocusedSession === switchSession) switchFocusedSession = null;
+          });
+        } else {
+          focusedParentSessionFile = null;
+          switchFocusedSession = null;
+        }
         latestCtx?.ui.notify(`Subagent ${name} finished; focus returned to parent.`, nativeError ? "error" : "info");
       }
       return {
@@ -1385,6 +1398,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     if (!prevAbort || prevAbort.signal.aborted) {
       (globalThis as any)[POLL_ABORT_KEY] = new AbortController();
     }
+    if (runningSubagents.size > 0) {
+      startWidgetRefresh();
+      startStatusRefresh(pi);
+    }
   });
 
   // Focus mode routes ordinary editor submissions to one native child session.
@@ -1407,7 +1424,28 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   });
 
   // Clean up on session shutdown
-  pi.on("session_shutdown", (_event, _ctx) => {
+  pi.on("session_shutdown", (event, _ctx) => {
+    const targetSessionFile = (event as any).targetSessionFile as string | undefined;
+    const switchingFocusedSession =
+      (event as any).reason === "resume" &&
+      !!targetSessionFile &&
+      (targetSessionFile === focusedParentSessionFile ||
+        Array.from(runningSubagents.values()).some((running) => running.sessionFile === targetSessionFile));
+
+    // Switching focus replaces only the visible session. Native child sessions
+    // must remain alive so input can continue to be routed to the focused one.
+    if (switchingFocusedSession) {
+      if (widgetInterval) {
+        clearInterval(widgetInterval);
+        widgetInterval = null;
+      }
+      if (statusInterval) {
+        clearInterval(statusInterval);
+        statusInterval = null;
+      }
+      return;
+    }
+
     if (widgetInterval) {
       clearInterval(widgetInterval);
       widgetInterval = null;
@@ -2180,6 +2218,17 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       const requested = args.trim();
       if (!requested || requested === "parent") {
         focusedSubagentId = null;
+        const parentSessionFile = focusedParentSessionFile;
+        const switchSession = switchFocusedSession;
+        if (parentSessionFile && switchSession) {
+          const switched = await switchSession(parentSessionFile);
+          if (switched.cancelled) {
+            ctx.ui.notify("Unable to return to the parent session.", "error");
+            return;
+          }
+        }
+        focusedParentSessionFile = null;
+        switchFocusedSession = null;
         ctx.ui.notify("Focus returned to parent agent.", "info");
         return;
       }
@@ -2188,7 +2237,22 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         ctx.ui.notify(`No running native subagent named "${requested}".`, "error");
         return;
       }
+      const parentSessionFile = ctx.sessionManager.getSessionFile();
+      if (!parentSessionFile) {
+        ctx.ui.notify("Unable to focus subagent: parent session has no file.", "error");
+        return;
+      }
+      focusedParentSessionFile = parentSessionFile;
+      switchFocusedSession = (sessionFile) => ctx.switchSession(sessionFile);
       focusedSubagentId = match.id;
+      const switched = await ctx.switchSession(match.sessionFile);
+      if (switched.cancelled) {
+        focusedSubagentId = null;
+        focusedParentSessionFile = null;
+        switchFocusedSession = null;
+        ctx.ui.notify(`Unable to focus on ${match.name}.`, "error");
+        return;
+      }
       ctx.ui.notify(`Focused on ${match.name}. Use /subagent-focus parent to return.`, "info");
     },
   });
@@ -2201,7 +2265,20 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       if (!selected || selected === "parent") focusedSubagentId = null;
       else {
         const match = Array.from(runningSubagents.values()).find((running) => running.name === selected);
-        focusedSubagentId = match?.id ?? null;
+        const parentSessionFile = ctx.sessionManager.getSessionFile();
+        if (match?.native && parentSessionFile) {
+          focusedParentSessionFile = parentSessionFile;
+          switchFocusedSession = (sessionFile) => ctx.switchSession(sessionFile);
+          focusedSubagentId = match.id;
+          const switched = await ctx.switchSession(match.sessionFile);
+          if (switched.cancelled) {
+            focusedSubagentId = null;
+            focusedParentSessionFile = null;
+            switchFocusedSession = null;
+          }
+        } else {
+          focusedSubagentId = null;
+        }
       }
       ctx.ui.notify(focusedSubagentId ? `Focused on ${selected}.` : "Focus returned to parent agent.", "info");
     },
