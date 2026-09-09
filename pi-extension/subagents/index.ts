@@ -2262,25 +2262,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     handler: async (ctx) => {
       const options = ["parent", ...Array.from(runningSubagents.values()).map((running) => running.name)];
       const selected = await ctx.ui.select("Focus subagent", options);
-      if (!selected || selected === "parent") focusedSubagentId = null;
-      else {
-        const match = Array.from(runningSubagents.values()).find((running) => running.name === selected);
-        const parentSessionFile = ctx.sessionManager.getSessionFile();
-        if (match?.native && parentSessionFile) {
-          focusedParentSessionFile = parentSessionFile;
-          switchFocusedSession = (sessionFile) => ctx.switchSession(sessionFile);
-          focusedSubagentId = match.id;
-          const switched = await ctx.switchSession(match.sessionFile);
-          if (switched.cancelled) {
-            focusedSubagentId = null;
-            focusedParentSessionFile = null;
-            switchFocusedSession = null;
-          }
-        } else {
-          focusedSubagentId = null;
-        }
-      }
-      ctx.ui.notify(focusedSubagentId ? `Focused on ${selected}.` : "Focus returned to parent agent.", "info");
+      if (!selected) return;
+
+      // Shortcut handlers receive ExtensionContext, which intentionally does
+      // not expose session replacement. Dispatch the command instead so Pi
+      // invokes it with ExtensionCommandContext.switchSession.
+      pi.sendUserMessage(`/subagent-focus ${selected}`, { expandPromptTemplates: true });
     },
   });
 
