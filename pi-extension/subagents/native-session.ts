@@ -3,7 +3,7 @@ import {
   DefaultResourceLoader,
   SessionManager,
   SettingsManager,
-  codingTools,
+  createCodingTools,
   type AgentSession,
   type ExtensionFactory,
 } from "@mariozechner/pi-coding-agent";
@@ -63,7 +63,7 @@ export async function createNativeSubagent(options: NativeSubagentOptions): Prom
     resourceLoader,
     model: options.model,
     tools: options.tools
-      ? codingTools.filter((tool) => options.tools!.includes(tool.name))
+      ? createCodingTools(options.cwd).filter((tool) => options.tools!.includes(tool.name))
       : undefined,
   } as any);
 
