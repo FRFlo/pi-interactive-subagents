@@ -605,7 +605,10 @@ interface RunningSubagent {
 const runningSubagents = new Map<string, RunningSubagent>();
 let focusedSubagentId: string | null = null;
 let focusedParentSessionFile: string | null = null;
-let switchFocusedSession: ((sessionFile: string) => Promise<{ cancelled: boolean }>) | null = null;
+let switchFocusedSession: ((
+  sessionFile: string,
+  options?: { withSession?: (ctx: any) => Promise<void> },
+) => Promise<{ cancelled: boolean }>) | null = null;
 
 // When this extension is loaded inside a subagent that itself spawns children
 // (e.g. a worker delegating to scout/researcher), `subagent-done.ts` runs in the
@@ -1338,15 +1341,22 @@ async function watchSubagent(
         const parentSessionFile = focusedParentSessionFile;
         const switchSession = switchFocusedSession;
         if (parentSessionFile && switchSession) {
-          void switchSession(parentSessionFile).finally(() => {
-            if (focusedParentSessionFile === parentSessionFile) focusedParentSessionFile = null;
-            if (switchFocusedSession === switchSession) switchFocusedSession = null;
+          void switchSession(parentSessionFile, {
+            withSession: async (nextCtx) => {
+              switchFocusedSession = (sessionFile, options) => nextCtx.switchSession(sessionFile, options);
+              nextCtx.ui.notify(`Subagent ${name} finished; focus returned to parent.`, nativeError ? "error" : "info");
+            },
+          }).finally(() => {
+            if (focusedParentSessionFile === parentSessionFile) {
+              focusedParentSessionFile = null;
+              switchFocusedSession = null;
+            }
           });
         } else {
           focusedParentSessionFile = null;
           switchFocusedSession = null;
+          latestCtx?.ui.notify(`Subagent ${name} finished.`, nativeError ? "error" : "info");
         }
-        latestCtx?.ui.notify(`Subagent ${name} finished; focus returned to parent.`, nativeError ? "error" : "info");
       }
       return {
         name,
@@ -2221,15 +2231,18 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const parentSessionFile = focusedParentSessionFile;
         const switchSession = switchFocusedSession;
         if (parentSessionFile && switchSession) {
-          const switched = await switchSession(parentSessionFile);
+          const switched = await switchSession(parentSessionFile, {
+            withSession: async (nextCtx) => {
+              switchFocusedSession = (sessionFile, options) => nextCtx.switchSession(sessionFile, options);
+              nextCtx.ui.notify("Focus returned to parent agent.", "info");
+            },
+          });
           if (switched.cancelled) {
-            ctx.ui.notify("Unable to return to the parent session.", "error");
             return;
           }
         }
         focusedParentSessionFile = null;
         switchFocusedSession = null;
-        ctx.ui.notify("Focus returned to parent agent.", "info");
         return;
       }
       const match = Array.from(runningSubagents.values()).find((running) => running.name === requested);
@@ -2243,17 +2256,20 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         return;
       }
       focusedParentSessionFile = parentSessionFile;
-      switchFocusedSession = (sessionFile) => ctx.switchSession(sessionFile);
+      switchFocusedSession = (sessionFile, options) => ctx.switchSession(sessionFile, options);
       focusedSubagentId = match.id;
-      const switched = await ctx.switchSession(match.sessionFile);
+      const switched = await ctx.switchSession(match.sessionFile, {
+        withSession: async (nextCtx) => {
+          switchFocusedSession = (sessionFile, options) => nextCtx.switchSession(sessionFile, options);
+          nextCtx.ui.notify(`Focused on ${match.name}. Use /subagent-focus parent to return.`, "info");
+        },
+      });
       if (switched.cancelled) {
         focusedSubagentId = null;
         focusedParentSessionFile = null;
         switchFocusedSession = null;
-        ctx.ui.notify(`Unable to focus on ${match.name}.`, "error");
         return;
       }
-      ctx.ui.notify(`Focused on ${match.name}. Use /subagent-focus parent to return.`, "info");
     },
   });
 
