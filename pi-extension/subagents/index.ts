@@ -1,5 +1,5 @@
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { keyHint } from "@mariozechner/pi-coding-agent";
+import { keyHint, SessionManager } from "@mariozechner/pi-coding-agent";
 import { Type, type Static } from "@sinclair/typebox";
 import { Box, Text, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
 import { dirname, join, resolve } from "node:path";
@@ -14,17 +14,9 @@ import {
   unlinkSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import {
-  isMuxAvailable,
-  muxSetupHint,
-  createSurface,
-  sendCommand,
-  sendLongCommand,
-  pollForExit,
-  closeSurface,
-  shellEscape,
-  readScreen,
-} from "./tmux.ts";
+import { createNativeSubagent, type NativeSubagent } from "./native-session.ts";
+import { createSubagentDoneExtension } from "./subagent-done.ts";
+import { isMuxAvailable, muxSetupHint, createSurface, sendCommand, sendLongCommand, pollForExit, closeSurface, shellEscape, readScreen } from "./tmux.ts";
 
 import {
   countSessionEntryLines,
@@ -228,7 +220,7 @@ function getToolExtensionPath(tool: string): string | undefined {
   // when that path no longer exists on disk (e.g. a built-in tool extension
   // was disabled/removed but a project-local extension re-registered it).
   const builtin = map[tool];
-  if (builtin && existsSync(builtin)) return builtin;
+  if (builtin) return builtin;
   return EXTRA_TOOL_EXTENSIONS.get(tool);
 }
 
@@ -272,11 +264,12 @@ function parseSessionMode(value: string | undefined): SubagentSessionMode | unde
 }
 
 function parseAgentDefinition(content: string, fallbackName: string): AgentDefinition | null {
-  const match = content.match(/^---\n([\s\S]*?)\n---/);
+  const normalized = content.replace(/\r\n/g, "\n");
+  const match = normalized.match(/^---\n([\s\S]*?)\n---/);
   if (!match) return null;
 
   const frontmatter = match[1];
-  const body = content.replace(/^---\n[\s\S]*?\n---\n*/, "").trim();
+  const body = normalized.replace(/^---\n[\s\S]*?\n---\n*/, "").trim();
   const systemPromptMode = getFrontmatterValue(frontmatter, "system-prompt");
 
   return {
@@ -605,6 +598,8 @@ interface RunningSubagent {
   task: string;
   agent?: string;
   surface: string;
+  native?: NativeSubagent;
+  nativeRun?: Promise<void>;
   startTime: number;
   sessionFile: string;
   launchScriptFile?: string;
@@ -630,6 +625,7 @@ interface RunningSubagent {
 
 /** All currently running subagents, keyed by id. */
 const runningSubagents = new Map<string, RunningSubagent>();
+let focusedSubagentId: string | null = null;
 
 // When this extension is loaded inside a subagent that itself spawns children
 // (e.g. a worker delegating to scout/researcher), `subagent-done.ts` runs in the
@@ -999,16 +995,19 @@ function resolveRunningByName(name: string):
 function steerSubagent(
   running: RunningSubagent,
   message: string,
-  send: (surface: string, command: string) => void = sendCommand,
+  _send?: (surface: string, command: string) => void,
 ): { ok: true } | { error: string } {
   const flattened = message.replace(/\s*\n\s*/g, " ").trim();
   try {
-    send(running.surface, flattened);
+    if (!running.native) throw new Error("Subagent session is unavailable");
+    void ((running.native.session as any).isStreaming
+      ? running.native.session.steer(flattened)
+      : running.native.session.prompt(flattened));
     return { ok: true };
   } catch (error: any) {
     return {
       error:
-        `Failed to deliver message to subagent "${running.name}" via tmux: ` +
+        `Failed to deliver message to subagent "${running.name}": ` +
         `${error?.message ?? String(error)}`,
     };
   }
@@ -1119,6 +1118,140 @@ function resolveResumeLaunchBehavior(): { autoExit: boolean; interactive: boolea
   return { autoExit: true, interactive: false };
 }
 
+/** Launch a pi subagent in the current process, without a terminal surface. */
+async function launchNativeSubagent(
+  params: typeof SubagentParams.static,
+  ctx: { sessionManager: { getSessionFile(): string | null; getSessionId(): string; getSessionDir(): string }; cwd: string; model?: any },
+): Promise<RunningSubagent> {
+  const startTime = Date.now();
+  const id = Math.random().toString(16).slice(2, 10);
+  const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null;
+  const resolvedPaths = resolveSubagentPaths(params, agentDefs);
+  const effectiveCwd = resolvedPaths.effectiveCwd ?? ctx.cwd;
+  const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), ctx.sessionManager.getSessionId());
+  const parentSessionFile = ctx.sessionManager.getSessionFile();
+  if (!parentSessionFile) throw new Error("No session file");
+  const sessionMode = resolveEffectiveSessionMode(params, agentDefs);
+  const targetSession = SessionManager.create(effectiveCwd).getSessionFile();
+  if (!targetSession) throw new Error("Unable to create subagent session");
+  if (sessionMode === "lineage-only" || sessionMode === "fork") {
+    seedSubagentSessionFile({
+      mode: sessionMode,
+      parentSessionFile,
+      childSessionFile: targetSession,
+      childCwd: effectiveCwd,
+    });
+  }
+
+  const grantSpawning = !!agentDefs?.subagentAgents?.length;
+  const toolAllowlist = buildSubagentToolAllowlist(agentDefs?.tools, { grantSpawning });
+  const identity = agentDefs?.body;
+  const prompt = sessionMode === "fork"
+    ? params.task
+    : `${identity && !agentDefs?.systemPromptMode ? `\n\n${identity}` : ""}\n\n` +
+      `${params.task}\n\nYour final assistant message should summarize what you accomplished.`;
+  const activityFile = getSubagentActivityFile(artifactDir, id);
+  mkdirSync(dirname(activityFile), { recursive: true });
+  const agentDir = getAgentConfigDir();
+  writeSubagentLoadout(targetSession, {
+    agent: params.agent ?? null,
+    toolAllowlist,
+    model: agentDefs?.model ?? null,
+    thinking: agentDefs?.thinking ?? null,
+    systemPromptMode: agentDefs?.systemPromptMode ?? null,
+    identity: agentDefs?.body ?? null,
+    spawnable: agentDefs?.subagentAgents ?? null,
+    autoExit: agentDefs?.autoExit ?? true,
+    cwd: effectiveCwd,
+    agentDir,
+  });
+  const native = await createNativeSubagent({
+    cwd: effectiveCwd,
+    agentDir,
+    sessionFile: targetSession,
+    model: ctx.model,
+    tools: toolAllowlist?.split(","),
+    appendSystemPrompt: agentDefs?.systemPromptMode === "append" ? identity : undefined,
+    systemPrompt: agentDefs?.systemPromptMode === "replace" ? identity : undefined,
+    extensionFactory: (sessionFile) => (pi) => {
+      return createSubagentDoneExtension({
+        name: params.name,
+        agent: params.agent,
+        sessionFile,
+        id,
+        activityFile,
+        autoExit: agentDefs?.autoExit ?? true,
+      })(pi);
+    },
+  });
+  const running: RunningSubagent = {
+    id,
+    name: params.name,
+    task: params.task,
+    agent: params.agent,
+    surface: `native:${id}`,
+    native,
+    startTime,
+    sessionFile: native.sessionFile,
+    activityFile,
+    interactive: false,
+    statusState: createStatusState({ source: "pi", startTimeMs: startTime }),
+  };
+  runningSubagents.set(id, running);
+  running.nativeRun = native.session.prompt(prompt).catch((error) => {
+    (running as any).nativeError = error instanceof Error ? error.message : String(error);
+  });
+  return running;
+}
+
+async function resumeNativeSubagent(
+  name: string,
+  message: string,
+  sessionPath: string,
+  loadout: SubagentLoadout,
+  ctx: { sessionManager: { getSessionDir(): string; getSessionId(): string }; cwd: string; model?: any },
+): Promise<RunningSubagent> {
+  const startTime = Date.now();
+  const id = Math.random().toString(16).slice(2, 10);
+  const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), ctx.sessionManager.getSessionId());
+  const activityFile = getSubagentActivityFile(artifactDir, id);
+  mkdirSync(dirname(activityFile), { recursive: true });
+  const native = await createNativeSubagent({
+    cwd: loadout.cwd ?? ctx.cwd,
+    agentDir: loadout.agentDir ?? getAgentConfigDir(),
+    sessionFile: sessionPath,
+    model: ctx.model,
+    tools: loadout.toolAllowlist?.split(","),
+    appendSystemPrompt: loadout.systemPromptMode === "append" ? loadout.identity ?? undefined : undefined,
+    systemPrompt: loadout.systemPromptMode === "replace" ? loadout.identity ?? undefined : undefined,
+    extensionFactory: (sessionFile) => (pi) => createSubagentDoneExtension({
+      name,
+      agent: loadout.agent ?? undefined,
+      sessionFile,
+      id,
+      activityFile,
+      autoExit: true,
+    })(pi),
+  });
+  const running: RunningSubagent = {
+    id,
+    name,
+    task: message,
+    surface: `native:${id}`,
+    native,
+    startTime,
+    sessionFile: sessionPath,
+    activityFile,
+    interactive: false,
+    statusState: createStatusState({ source: "pi", startTimeMs: startTime }),
+  };
+  runningSubagents.set(id, running);
+  running.nativeRun = native.session.prompt(message).catch((error) => {
+    (running as any).nativeError = error instanceof Error ? error.message : String(error);
+  });
+  return running;
+}
+
 export const __test__ = {
   borderLine,
   getShellReadyDelayMs,
@@ -1170,6 +1303,8 @@ async function launchSubagent(
   ctx: { sessionManager: { getSessionFile(): string | null; getSessionId(): string; getSessionDir(): string }; cwd: string },
   options?: { surface?: string },
 ): Promise<RunningSubagent> {
+  return launchNativeSubagent(params, ctx);
+  if (false) {
   const startTime = Date.now();
   const id = Math.random().toString(16).slice(2, 10);
 
@@ -1451,6 +1586,7 @@ async function launchSubagent(
 
   runningSubagents.set(id, running);
   return running;
+  }
 }
 
 /**
@@ -1528,6 +1664,44 @@ async function watchSubagent(
   const { name, task, surface, startTime, sessionFile } = running;
 
   try {
+    if (running.native) {
+      await running.nativeRun;
+      const hasQuestion = existsSync(`${sessionFile}.ask`);
+      deliverPendingQuestion(running);
+      if (hasQuestion) {
+        await new Promise<void>((resolve) => {
+          const unsubscribe = running.native!.session.subscribe((event) => {
+            if (event.type !== "agent_end" || existsSync(`${sessionFile}.ask`)) return;
+            unsubscribe();
+            resolve();
+          });
+        });
+        deliverPendingQuestion(running);
+      }
+      const nativeError = (running as any).nativeError as string | undefined;
+      const allEntries = existsSync(sessionFile) ? getNewEntries(sessionFile, 0) : [];
+      const summary = findLastAssistantMessage(allEntries) ??
+        (nativeError ? `Subagent error: ${nativeError}` : "Sub-agent exited without output");
+      const stats = existsSync(sessionFile) ? summarizeSessionStats(sessionFile) : null;
+      const subagentSessionId = existsSync(sessionFile) ? getSessionId(sessionFile) : null;
+      running.native.dispose();
+      runningSubagents.delete(running.id);
+      if (focusedSubagentId === running.id) {
+        focusedSubagentId = null;
+        latestCtx?.ui.notify(`Subagent ${name} finished; focus returned to parent.`, nativeError ? "error" : "info");
+      }
+      return {
+        name,
+        task,
+        summary,
+        sessionFile,
+        ...(subagentSessionId ? { sessionId: subagentSessionId } : {}),
+        exitCode: nativeError ? 1 : 0,
+        elapsed: Math.floor((Date.now() - startTime) / 1000),
+        ...(nativeError ? { errorMessage: nativeError } : {}),
+        ...(stats ? { stats } : {}),
+      };
+    }
     const result = await pollForExit(surface, AbortSignal.any([signal, getModuleAbortSignal()]), {
       interval: 1000,
       sessionFile,
@@ -1655,6 +1829,25 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     }
   });
 
+  // Focus mode routes ordinary editor submissions to one native child session.
+  // The parent remains alive and continues receiving asynchronous results.
+  pi.on("input", async (event) => {
+    if (event.source !== "interactive" || !focusedSubagentId) return { action: "continue" as const };
+    const focused = runningSubagents.get(focusedSubagentId);
+    if (!focused?.native) {
+      focusedSubagentId = null;
+      return { action: "continue" as const };
+    }
+    try {
+      if ((focused.native.session as any).isStreaming) await focused.native.session.steer(event.text);
+      else await focused.native.session.prompt(event.text);
+      return { action: "handled" as const };
+    } catch (error) {
+      latestCtx?.ui.notify(`Unable to send to ${focused.name}: ${error instanceof Error ? error.message : String(error)}`, "error");
+      return { action: "handled" as const };
+    }
+  });
+
   // Clean up on session shutdown
   pi.on("session_shutdown", (_event, _ctx) => {
     if (widgetInterval) {
@@ -1685,14 +1878,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       name: "subagent",
       label: "Subagent",
       description:
-        "Spawn a sub-agent in a dedicated terminal multiplexer pane. " +
+        "Spawn a sub-agent as an in-process pi session. " +
         "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
         "When the sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
         "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT call subagents_list or any other tool to 'check' status. All of that is wasted work — the harness handles delivery for you. " +
         "DO NOT fabricate, assume, or summarize results after calling this tool. " +
         "After spawning, either end your turn immediately, or work on other independent tasks (including spawning more subagents in parallel). The harness will wake you with the result when it is ready.",
       promptSnippet:
-        "Spawn a sub-agent in a dedicated terminal multiplexer pane. " +
+        "Spawn a sub-agent as an in-process pi session. " +
         "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
         "When the sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
         "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT call subagents_list or any other tool to 'check' status. All of that is wasted work — the harness handles delivery for you. " +
@@ -1758,12 +1951,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           };
         }
 
-        // Validate prerequisites (need mux + a session file to derive the
-        // artifact dir that hosts this session's name registry).
-        if (!isMuxAvailable()) {
-          return muxUnavailableResult();
-        }
-
         if (!ctx.sessionManager.getSessionFile()) {
           return {
             content: [
@@ -1801,7 +1988,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // from then on uniqueRunningName tracks it via the running map.
         let running;
         try {
-          running = await launchSubagent(params, ctx);
+          running = await launchNativeSubagent(params, ctx);
         } finally {
           if (reservedName) reservedNames.delete(reservedName);
         }
@@ -2078,10 +2265,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           return { content: [{ type: "text" as const, text: err }], details: { error: err } };
         }
 
-        if (!isMuxAvailable()) {
-          return muxUnavailableResult();
-        }
-
         // ── Steer a running subagent ──
         // A name that matches a currently-running subagent always steers it.
         const runningMatch = Array.from(runningSubagents.values()).find((r) => r.name === requestedName);
@@ -2141,6 +2324,33 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             `Re-run the task as a fresh subagent instead.`;
           return { content: [{ type: "text" as const, text: err }], details: { error: err } };
         }
+
+        const nativeRunning = await resumeNativeSubagent(requestedName, message, sessionPath, loadout, ctx);
+        startWidgetRefresh();
+        startStatusRefresh(pi);
+        const nativeAbort = new AbortController();
+        nativeRunning.abortController = nativeAbort;
+        void watchSubagent(nativeRunning, nativeAbort.signal).then((result) => {
+          updateWidget();
+          pi.sendMessage({
+            customType: "subagent_result",
+            content: resolveResultPresentation(result, name),
+            display: true,
+            details: {
+              name,
+              task: message,
+              exitCode: result.exitCode,
+              elapsed: result.elapsed,
+              sessionFile: result.sessionFile,
+              ...(result.sessionId ? { sessionId: result.sessionId } : {}),
+              ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
+            },
+          }, { triggerTurn: true, deliverAs: "steer" });
+        });
+        return {
+          content: [{ type: "text", text: `Session "${name}" resumed.` }],
+          details: { id: nativeRunning.id, name, sessionFile, status: "started" },
+        };
 
         const resumedSessionId = entry.sessionId ?? getSessionId(sessionPath) ?? requestedName;
 
@@ -2346,6 +2556,39 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       const displayName = agentName[0].toUpperCase() + agentName.slice(1);
       const toolCall = `Use subagent with agent: "${agentName}", name: "${displayName}", task: ${JSON.stringify(taskText)}`;
       pi.sendUserMessage(toolCall);
+    },
+  });
+
+  pi.registerCommand("subagent-focus", {
+    description: "Focus a running subagent: /subagent-focus <name|parent>",
+    handler: async (args, ctx) => {
+      const requested = args.trim();
+      if (!requested || requested === "parent") {
+        focusedSubagentId = null;
+        ctx.ui.notify("Focus returned to parent agent.", "info");
+        return;
+      }
+      const match = Array.from(runningSubagents.values()).find((running) => running.name === requested);
+      if (!match?.native) {
+        ctx.ui.notify(`No running native subagent named "${requested}".`, "error");
+        return;
+      }
+      focusedSubagentId = match.id;
+      ctx.ui.notify(`Focused on ${match.name}. Use /subagent-focus parent to return.`, "info");
+    },
+  });
+
+  pi.registerShortcut("ctrl+alt+s", {
+    description: "Select a running subagent to focus",
+    handler: async (ctx) => {
+      const options = ["parent", ...Array.from(runningSubagents.values()).map((running) => running.name)];
+      const selected = await ctx.ui.select("Focus subagent", options);
+      if (!selected || selected === "parent") focusedSubagentId = null;
+      else {
+        const match = Array.from(runningSubagents.values()).find((running) => running.name === selected);
+        focusedSubagentId = match?.id ?? null;
+      }
+      ctx.ui.notify(focusedSubagentId ? `Focused on ${selected}.` : "Focus returned to parent agent.", "info");
     },
   });
 

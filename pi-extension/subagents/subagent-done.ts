@@ -110,19 +110,29 @@ export function parseDeniedTools(rawValue: string | undefined): string[] {
     .filter(Boolean);
 }
 
-export default function (pi: ExtensionAPI) {
+export interface SubagentDoneConfig {
+  name?: string;
+  agent?: string;
+  sessionFile?: string;
+  id?: string;
+  activityFile?: string;
+  autoExit?: boolean;
+}
+
+export function createSubagentDoneExtension(config: SubagentDoneConfig = {}) {
+ return function subagentDoneExtension(pi: ExtensionAPI) {
   let toolNames: string[] = [];
   let denied: string[] = [];
   let expanded = false;
 
   // Read subagent identity from env vars (set by parent orchestrator)
-  const subagentName = process.env.PI_SUBAGENT_NAME ?? "";
-  const subagentAgent = process.env.PI_SUBAGENT_AGENT ?? "";
+  const subagentName = config.name ?? process.env.PI_SUBAGENT_NAME ?? "";
+  const subagentAgent = config.agent ?? process.env.PI_SUBAGENT_AGENT ?? "";
   const deniedToolsValue = process.env.PI_DENY_TOOLS;
-  const autoExit = process.env.PI_SUBAGENT_AUTO_EXIT === "1";
+  const autoExit = config.autoExit ?? process.env.PI_SUBAGENT_AUTO_EXIT === "1";
   const recorder = createSubagentActivityRecorder({
-    runningChildId: process.env.PI_SUBAGENT_ID,
-    activityFile: process.env.PI_SUBAGENT_ACTIVITY_FILE,
+    runningChildId: config.id ?? process.env.PI_SUBAGENT_ID,
+    activityFile: config.activityFile ?? process.env.PI_SUBAGENT_ACTIVITY_FILE,
   });
 
   function renderWidget(ctx: { ui: { setWidget: Function } }, _theme: any) {
@@ -246,7 +256,7 @@ export default function (pi: ExtensionAPI) {
       // Without this the parent would only see exit code 0 and a stale
       // assistant message, mistaking the crash for a successful completion.
       const errorInfo = findLatestAssistantError(messages);
-      const sessionFile = process.env.PI_SUBAGENT_SESSION;
+      const sessionFile = config.sessionFile ?? process.env.PI_SUBAGENT_SESSION;
       if (errorInfo && sessionFile) {
         try {
           writeFileSync(
@@ -369,8 +379,8 @@ export default function (pi: ExtensionAPI) {
       awaitingAnswer = true;
       recorder.askQuestion();
       const askData = {
-        name: process.env.PI_SUBAGENT_NAME ?? "subagent",
-        agent: process.env.PI_SUBAGENT_AGENT ?? "",
+        name: subagentName || "subagent",
+        agent: subagentAgent,
         question: params.question,
       };
       writeFileSync(`${sessionFile}.ask`, JSON.stringify(askData));
@@ -396,4 +406,9 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+ };
+}
+
+export default function (pi: ExtensionAPI) {
+  return createSubagentDoneExtension()(pi);
 }

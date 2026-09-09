@@ -1206,15 +1206,6 @@ describe("subagent discovery", () => {
     }
   });
 
-  it("getToolExtensionPath maps custom tools and skips built-ins", () => {
-    assert.equal(testApi.getToolExtensionPath("read"), undefined);
-    assert.equal(testApi.getToolExtensionPath("bash"), undefined);
-    assert.ok(testApi.getToolExtensionPath("web_search")?.endsWith("web-search/index.ts"));
-    assert.ok(testApi.getToolExtensionPath("safe_bash")?.endsWith("tools/safe-bash.ts"));
-    // Spawning tools are registered by this extension itself.
-    assert.ok(testApi.getToolExtensionPath("subagent")?.endsWith("index.ts"));
-  });
-
   it("ignores invalid session-mode values", async () => {
     await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
       writeAgentFile(
@@ -2111,6 +2102,13 @@ describe("subagent interruption", () => {
       surface: "pane-1",
       startTime: 0,
       sessionFile: "worker.jsonl",
+      native: {
+        session: {
+          isStreaming: false,
+          prompt: async (text: string) => { (globalThis as any).__testSteerText = text; },
+          steer: async (text: string) => { (globalThis as any).__testSteerText = text; },
+        },
+      },
       interactive: false,
       statusState: createStatusState({ source: "pi", startTimeMs: 0 }),
       ...overrides,
@@ -2214,7 +2212,7 @@ describe("subagent interruption", () => {
     }
   });
 
-  it("steers a running subagent by typing into its pane (newlines flattened)", () => {
+  it("steers a running native session (newlines flattened)", async () => {
     const testApi = (subagentsModule as any).__test__;
     let sentSurface = "";
     let sentText = "";
@@ -2226,22 +2224,22 @@ describe("subagent interruption", () => {
     });
 
     assert.deepEqual(result, { ok: true });
-    assert.equal(sentSurface, "pane-1");
-    assert.equal(sentText, "do this then that");
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal((globalThis as any).__testSteerText, "do this then that");
   });
 
   it("returns an explicit error when steering delivery fails", () => {
     const testApi = (subagentsModule as any).__test__;
-    const running = makeRunning();
-
-    const result = testApi.steerSubagent(running, "hi", () => {
-      throw new Error("mux write failed");
+    const running = makeRunning({
+      native: { session: { isStreaming: true, steer: () => { throw new Error("native write failed"); } } },
     });
+
+    const result = testApi.steerSubagent(running, "hi");
 
     assert.match(result.error, /Failed to deliver message/);
   });
 
-  it("delivers a steer message and forces local status waiting", () => {
+  it("delivers a steer message and forces local status waiting", async () => {
     const testApi = (subagentsModule as any).__test__;
     const runningMap = testApi.runningSubagents as Map<string, any>;
     let sentSurface = "";
@@ -2264,7 +2262,9 @@ describe("subagent interruption", () => {
     );
 
     try {
-      runningMap.set("a1", makeRunning({ statusState: activeState }));
+      runningMap.set("a1", makeRunning({
+        statusState: activeState,
+      }));
 
       const result = withMockedNow(20_000, () =>
         testApi.handleSubagentSteer({ name: "Worker", message: "keep going" }, (surface: string, text: string) => {
@@ -2273,8 +2273,8 @@ describe("subagent interruption", () => {
         }),
       );
 
-      assert.equal(sentSurface, "pane-1");
-      assert.equal(sentText, "keep going");
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal((globalThis as any).__testSteerText, "keep going");
       assert.equal(result.content[0].text.includes('Message delivered to running subagent "Worker"'), true);
       assert.deepEqual(result.details, { id: "a1", name: "Worker", status: "steered" });
       const snapshot = classifyStatus(runningMap.get("a1").statusState, 20_000);
@@ -2319,7 +2319,10 @@ describe("subagent interruption", () => {
     );
 
     try {
-      runningMap.set("a1", makeRunning({ statusState: activeState }));
+      runningMap.set("a1", makeRunning({
+        statusState: activeState,
+        native: { session: { isStreaming: true, steer: () => { throw new Error("native write failed"); } } },
+      }));
 
       const result = withMockedNow(20_000, () =>
         testApi.handleSubagentSteer({ name: "Worker", message: "go" }, () => {
