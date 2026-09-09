@@ -25,8 +25,16 @@ Use `/subagent-focus <name>` to route editor input to a child, `/subagent-focus 
 | `subagent_message` | Message a sub-agent by name — steers it if running, resumes its session if finished |
 | `subagent_list` | List spawned sub-agent sessions and their latest persisted result |
 | `subagent_read` | Read the latest persisted result from one spawned sub-agent |
+| `subagent_cancel` | Cancel a running session by name while preserving its transcript |
+| `subagent_transcript` | Read paginated transcript messages, optionally including tool results |
+| `subagent_tools` | Inspect the persisted sandbox, tool allowlist, model, cwd, and spawn permissions |
+| `subagent_fork` | Create a new named session from an existing transcript and sandbox |
+| `subagent_restart` | Start a fresh session with a finished sub-agent's sandbox |
+| `subagent_diagnostics` | Inspect runtime, activity, session, sidecar, statistics, and event diagnostics |
 | `subagents_list` | List available agent definitions |
 | `ask_question` | *(sub-agent sessions only)* Ask the orchestrator a question and wait for the reply |
+| `report_progress` | *(sub-agent sessions only)* Publish a non-blocking milestone to the orchestrator |
+| `publish_artifact` | *(sub-agent sessions only)* Publish an existing file from the sub-agent cwd |
 
 There is also a `/subagent <agent> <task>` command for spawning directly.
 
@@ -59,6 +67,37 @@ subagent_message({ name: "scout", message: "Also check the auth middleware" });
 Every spawn records name → session file in `artifacts/<sessionId>/subagent-registry.json`, so names stay addressable across pi restarts. A nested sub-agent that spawns children gets its own registry keyed by its own session id. Resume is refused with a clear error (listing known names) if the name isn't registered, the session file is gone, or the session predates sandboxed resume.
 
 **Resume replays the original sandbox.** At spawn time the fully-resolved loadout — tool allowlist, backing extensions, model, thinking level, system prompt, spawn whitelist, cwd — is snapshotted to `<session>.loadout.json`. Resume rebuilds the exact same restricted process from that snapshot rather than relaunching unrestricted.
+
+### Session control and inspection
+
+```typescript
+subagent_cancel({ name: "dark-mode" });
+subagent_transcript({ name: "scout", limit: 20, includeTools: false });
+subagent_tools({ name: "scout" });
+subagent_diagnostics({ name: "scout" });
+subagent_fork({ name: "scout", newName: "scout-alt", task: "Try the alternate approach" });
+subagent_restart({ name: "scout", task: "Repeat from a clean transcript" });
+```
+
+Transcript pages are returned newest-first by page while retaining chronological
+order inside each page. Pass the returned `nextBefore` id as `before` to read
+the preceding page. Fork copies the complete source transcript into a new
+session; restart creates a fresh transcript. Both replay the source sandbox and
+deliver completion asynchronously like `subagent`.
+
+### Progress and artifacts
+
+Sub-agents can publish milestones without blocking or asking a question:
+
+```typescript
+report_progress({ message: "Implementation complete; running tests", percent: 75 });
+publish_artifact({ path: "reports/audit.md", description: "Security audit" });
+```
+
+Progress and artifact events are persisted beside the child session and shown
+to the parent immediately. Published files must already exist and remain inside
+the sub-agent working directory; publication exposes the path, it does not copy
+or upload the file.
 
 ### ask_question
 
@@ -193,7 +232,7 @@ You are a specialized agent that does X...
 | `model` | string | Default model |
 | `thinking` | string | `minimal`, `low`, `medium`, or `high` |
 | `tools` | string | Strict tool allowlist. Built-ins: `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`. Extension-backed: `web_search`, `web_fetch`, `safe_bash`, `video_extract`, `youtube_search`, `google_image_search`. Only the extensions backing the listed tools are loaded into the child |
-| `subagent_agents` | string | Comma-separated agent names this agent may spawn. **Presence of this field grants the spawning toolset** (`subagent`, `subagent_message`, `subagents_list`) and restricts spawn targets to the list. Omit it and the agent cannot spawn at all |
+| `subagent_agents` | string | Comma-separated agent names this agent may spawn. **Presence of this field grants the spawning and child-session management tools** and restricts spawn targets to the list. Omit it and the agent cannot spawn or manage children |
 | `skills` | string | Comma-separated skill names to auto-load |
 | `session-mode` | string | `standalone` (default), `lineage-only`, or `fork` — see below |
 | `system-prompt` | string | `append` or `replace`: control how the agent body is applied to the native session prompt |

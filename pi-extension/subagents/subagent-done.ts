@@ -15,8 +15,10 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Box, Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
-import { writeFileSync } from "node:fs";
+import { existsSync, statSync, writeFileSync } from "node:fs";
+import { isAbsolute, relative, resolve } from "node:path";
 import { createSubagentActivityRecorder } from "./activity.ts";
+import { appendSubagentEvent } from "./session.ts";
 
 export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
   return agentStarted;
@@ -117,6 +119,7 @@ export interface SubagentDoneConfig {
   id?: string;
   activityFile?: string;
   autoExit?: boolean;
+  cwd?: string;
 }
 
 export function createSubagentDoneExtension(config: SubagentDoneConfig = {}) {
@@ -403,6 +406,61 @@ export function createSubagentDoneExtension(config: SubagentDoneConfig = {}) {
         theme.fg("toolTitle", theme.bold("ask_question ")) +
         theme.fg("muted", String((args as any).question ?? ""));
       return new Text(text, 0, 0);
+    },
+  });
+
+  pi.registerTool({
+    name: "report_progress",
+    label: "Report Progress",
+    description:
+      "Send a non-blocking progress update to the parent orchestrator. Use this for meaningful milestones, not routine tool activity.",
+    parameters: Type.Object({
+      message: Type.String({ description: "Short description of progress made or work remaining." }),
+      percent: Type.Optional(Type.Number({ minimum: 0, maximum: 100 })),
+    }),
+    async execute(_toolCallId, params) {
+      const sessionFile = config.sessionFile ?? process.env.PI_SUBAGENT_SESSION;
+      if (!sessionFile) throw new Error("report_progress is only available in subagent contexts.");
+      appendSubagentEvent(sessionFile, {
+        type: "progress",
+        timestamp: new Date().toISOString(),
+        message: params.message,
+        ...(params.percent === undefined ? {} : { percent: params.percent }),
+      });
+      return {
+        content: [{ type: "text", text: "Progress update sent to the orchestrator." }],
+        details: { message: params.message, percent: params.percent },
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "publish_artifact",
+    label: "Publish Artifact",
+    description:
+      "Publish an existing file from the subagent working directory to the parent orchestrator. The file must remain inside the subagent cwd.",
+    parameters: Type.Object({
+      path: Type.String({ description: "Relative or absolute path to an existing file inside the subagent cwd." }),
+      description: Type.Optional(Type.String({ description: "Short explanation of the artifact." })),
+    }),
+    async execute(_toolCallId, params) {
+      const sessionFile = config.sessionFile ?? process.env.PI_SUBAGENT_SESSION;
+      if (!sessionFile) throw new Error("publish_artifact is only available in subagent contexts.");
+      const cwd = resolve(config.cwd ?? process.cwd());
+      const artifactPath = resolve(cwd, params.path);
+      const rel = relative(cwd, artifactPath);
+      if (rel.startsWith("..") || isAbsolute(rel)) throw new Error("Artifact path must remain inside the subagent cwd.");
+      if (!existsSync(artifactPath) || !statSync(artifactPath).isFile()) throw new Error(`Artifact file not found: ${params.path}`);
+      appendSubagentEvent(sessionFile, {
+        type: "artifact",
+        timestamp: new Date().toISOString(),
+        path: artifactPath,
+        ...(params.description ? { description: params.description } : {}),
+      });
+      return {
+        content: [{ type: "text", text: `Artifact published: ${artifactPath}` }],
+        details: { path: artifactPath, description: params.description },
+      };
     },
   });
 

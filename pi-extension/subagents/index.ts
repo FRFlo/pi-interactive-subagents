@@ -19,9 +19,11 @@ import { createSubagentDoneExtension } from "./subagent-done.ts";
 import {
   countSessionEntryLines,
   findLastAssistantMessage,
+  forkSubagentSessionFile,
   getNewEntries,
   getSessionId,
   readNameRegistry,
+  readSubagentEvents,
   readSubagentLoadout,
   registerName,
   resolveNameInRegistry,
@@ -148,6 +150,14 @@ const SPAWNING_TOOLS = [
   "subagent",
   "subagent_message",
   "subagents_list",
+  "subagent_list",
+  "subagent_read",
+  "subagent_cancel",
+  "subagent_transcript",
+  "subagent_tools",
+  "subagent_fork",
+  "subagent_restart",
+  "subagent_diagnostics",
 ] as const;
 
 /** Built-in tools pi provides natively — no extension needs to be loaded. */
@@ -580,6 +590,8 @@ interface RunningSubagent {
   };
   abortController?: AbortController;
   statusState: SubagentStatusState;
+  eventCount?: number;
+  cancelled?: boolean;
   /**
    * When true, status transitions (stalled/recovered) do not wake the parent
    * session via a steer message. The widget still updates locally. Used for
@@ -620,6 +632,28 @@ function formatElapsedMMSS(startTime: number): string {
   const m = Math.floor(seconds / 60);
   const s = seconds % 60;
   return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+}
+
+function transcriptMessageText(entry: any): string {
+  const content = entry?.message?.content;
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .filter((part: any) => part?.type === "text" && typeof part.text === "string")
+    .map((part: any) => part.text)
+    .join("\n");
+}
+
+function buildTranscriptPage(entries: any[], limit: number, before?: string, includeTools = false) {
+  const messages = entries.filter((entry) =>
+    entry?.type === "message" && (includeTools || entry.message?.role !== "toolResult"));
+  const beforeIndex = before ? messages.findIndex((entry) => entry.id === before) : messages.length;
+  const end = beforeIndex >= 0 ? beforeIndex : messages.length;
+  const page = messages.slice(Math.max(0, end - limit), end);
+  return {
+    messages: page.map((entry) => ({ id: entry.id, role: entry.message?.role, text: transcriptMessageText(entry) })),
+    nextBefore: end - limit > 0 ? page[0]?.id ?? null : null,
+  };
 }
 
 const ACCENT = "\x1b[38;2;77;163;255m";
@@ -1067,6 +1101,7 @@ async function launchNativeSubagent(
         id,
         activityFile,
         autoExit: agentDefs?.autoExit ?? true,
+        cwd: effectiveCwd,
       })(pi);
     },
   });
@@ -1116,6 +1151,7 @@ async function resumeNativeSubagent(
       id,
       activityFile,
       autoExit: true,
+      cwd: loadout.cwd ?? ctx.cwd,
     })(pi),
   });
   const running: RunningSubagent = {
@@ -1134,6 +1170,24 @@ async function resumeNativeSubagent(
     (running as any).nativeError = error instanceof Error ? error.message : String(error);
   });
   return running;
+}
+
+async function cloneNativeSubagent(
+  name: string,
+  message: string,
+  sourceSession: string,
+  loadout: SubagentLoadout,
+  mode: "restart" | "fork",
+  ctx: { sessionManager: { getSessionDir(): string; getSessionId(): string }; cwd: string; model?: any },
+): Promise<RunningSubagent> {
+  const cwd = loadout.cwd ?? ctx.cwd;
+  const targetSession = SessionManager.create(cwd).getSessionFile();
+  if (!targetSession) throw new Error("Unable to create cloned subagent session");
+  if (mode === "fork") {
+    forkSubagentSessionFile({ sourceSessionFile: sourceSession, childSessionFile: targetSession, childCwd: cwd });
+  }
+  writeSubagentLoadout(targetSession, loadout);
+  return resumeNativeSubagent(name, message, targetSession, loadout, ctx);
 }
 
 export const __test__ = {
@@ -1215,6 +1269,24 @@ function deliverPendingQuestion(running: RunningSubagent): void {
   );
 }
 
+function deliverPendingSubagentEvents(running: RunningSubagent): void {
+  const events = readSubagentEvents(running.sessionFile);
+  const start = running.eventCount ?? 0;
+  running.eventCount = events.length;
+  for (const event of events.slice(start)) {
+    const isProgress = event.type === "progress";
+    const content = isProgress
+      ? `Subagent "${running.name}" progress${event.percent === undefined ? "" : ` (${event.percent}%)`}: ${event.message}`
+      : `Subagent "${running.name}" published artifact: ${event.path}${event.description ? ` — ${event.description}` : ""}`;
+    latestPi?.sendMessage({
+      customType: isProgress ? "subagent_progress" : "subagent_artifact",
+      content,
+      display: true,
+      details: { name: running.name, ...event },
+    }, { triggerTurn: false });
+  }
+}
+
 async function watchSubagent(
   running: RunningSubagent,
   signal: AbortSignal,
@@ -1223,7 +1295,15 @@ async function watchSubagent(
 
   try {
     if (running.native) {
+      deliverPendingSubagentEvents(running);
+      const unsubscribeEvents = running.native.session.subscribe((event) => {
+        if (event.type === "tool_result" || event.type === "agent_end") {
+          deliverPendingSubagentEvents(running);
+        }
+      });
       await running.nativeRun;
+      unsubscribeEvents();
+      deliverPendingSubagentEvents(running);
       const hasQuestion = existsSync(`${sessionFile}.ask`);
       deliverPendingQuestion(running);
       if (hasQuestion) {
@@ -1231,8 +1311,15 @@ async function watchSubagent(
           const unsubscribe = running.native!.session.subscribe((event) => {
             if (event.type !== "agent_end" || existsSync(`${sessionFile}.ask`)) return;
             unsubscribe();
+            signal.removeEventListener("abort", onAbort);
             resolve();
           });
+          const onAbort = () => {
+            unsubscribe();
+            signal.removeEventListener("abort", onAbort);
+            resolve();
+          };
+          signal.addEventListener("abort", onAbort, { once: true });
         });
         deliverPendingQuestion(running);
       }
@@ -1254,9 +1341,9 @@ async function watchSubagent(
         summary,
         sessionFile,
         ...(subagentSessionId ? { sessionId: subagentSessionId } : {}),
-        exitCode: nativeError ? 1 : 0,
+        exitCode: nativeError || running.cancelled ? 1 : 0,
         elapsed: Math.floor((Date.now() - startTime) / 1000),
-        ...(nativeError ? { errorMessage: nativeError } : {}),
+        ...(nativeError ? { errorMessage: nativeError } : running.cancelled ? { errorMessage: "Subagent cancelled." } : {}),
         ...(stats ? { stats } : {}),
       };
     }
@@ -1664,6 +1751,141 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   // ── subagent_list tool ──
   // `subagents_list` lists available agent definitions; this tool lists the
   // actual sessions belonging to the current parent conversation.
+  const resolveSessionByName = (name: string, ctx: any) => {
+    const running = Array.from(runningSubagents.values()).find((candidate) => candidate.name === name);
+    const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), ctx.sessionManager.getSessionId());
+    const entry = running
+      ? { sessionFile: running.sessionFile, sessionId: getSessionId(running.sessionFile) }
+      : resolveNameInRegistry(artifactDir, name);
+    return { running, entry, artifactDir };
+  };
+
+  const superviseClone = (running: RunningSubagent, name: string, task: string) => {
+    startWidgetRefresh();
+    startStatusRefresh(pi);
+    const abort = new AbortController();
+    running.abortController = abort;
+    void watchSubagent(running, abort.signal).then((result) => {
+      updateWidget();
+      pi.sendMessage({
+        customType: "subagent_result",
+        content: resolveResultPresentation(result, name),
+        display: true,
+        details: { name, task, exitCode: result.exitCode, elapsed: result.elapsed, sessionFile: result.sessionFile },
+      }, { triggerTurn: true, deliverAs: "steer" });
+    });
+  };
+
+  pi.registerTool({
+    name: "subagent_cancel",
+    label: "Cancel Subagent",
+    description: "Cancel a running native subagent by exact name while preserving its transcript for later inspection or restart.",
+    parameters: Type.Object({ name: Type.String() }),
+    async execute(_id, params) {
+      const running = Array.from(runningSubagents.values()).find((candidate) => candidate.name === params.name.trim());
+      if (!running?.native) return { content: [{ type: "text", text: `No running subagent named "${params.name}".` }], details: { error: "not running" } };
+      running.cancelled = true;
+      try { unlinkSync(`${running.sessionFile}.ask`); } catch {}
+      await running.native.session.abort();
+      running.abortController?.abort();
+      return { content: [{ type: "text", text: `Subagent "${running.name}" cancelled.` }], details: { name: running.name, status: "cancelled" } };
+    },
+  });
+
+  pi.registerTool({
+    name: "subagent_transcript",
+    label: "Subagent Transcript",
+    description: "Read a paginated subagent transcript. Returns newest messages up to `limit`; pass `before` from nextBefore for older messages.",
+    parameters: Type.Object({
+      name: Type.String(),
+      limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
+      before: Type.Optional(Type.String()),
+      includeTools: Type.Optional(Type.Boolean()),
+    }),
+    async execute(_id, params, _signal, _update, ctx) {
+      const { entry } = resolveSessionByName(params.name.trim(), ctx);
+      if (!entry?.sessionFile || !existsSync(entry.sessionFile)) return { content: [{ type: "text", text: `No readable subagent named "${params.name}".` }], details: { error: "not found" } };
+      const page = buildTranscriptPage(getNewEntries(entry.sessionFile, 0), params.limit ?? 20, params.before, params.includeTools ?? false);
+      const text = page.messages.length
+        ? page.messages.map((message) => `[${message.role}] ${message.text}`).join("\n\n")
+        : "No transcript messages matched.";
+      return { content: [{ type: "text", text }], details: { name: params.name, ...page } };
+    },
+  });
+
+  pi.registerTool({
+    name: "subagent_tools",
+    label: "Subagent Tools",
+    description: "Inspect a subagent's persisted sandbox loadout: tools, model, cwd, identity mode, and spawnable agents.",
+    parameters: Type.Object({ name: Type.String() }),
+    async execute(_id, params, _signal, _update, ctx) {
+      const { entry } = resolveSessionByName(params.name.trim(), ctx);
+      const loadout = entry?.sessionFile ? readSubagentLoadout(entry.sessionFile) : null;
+      if (!loadout) return { content: [{ type: "text", text: `No sandbox loadout found for "${params.name}".` }], details: { error: "no loadout" } };
+      return { content: [{ type: "text", text: JSON.stringify(loadout, null, 2) }], details: { name: params.name, loadout } };
+    },
+  });
+
+  const registerCloneTool = (mode: "restart" | "fork") => pi.registerTool({
+    name: mode === "restart" ? "subagent_restart" : "subagent_fork",
+    label: mode === "restart" ? "Restart Subagent" : "Fork Subagent",
+    description: mode === "restart"
+      ? "Start a fresh session with the same persisted sandbox as a finished subagent."
+      : "Create a new named session from a subagent's complete transcript and persisted sandbox.",
+    parameters: Type.Object({
+      name: Type.String({ description: "Existing subagent name." }),
+      newName: Type.Optional(Type.String({ description: "Required for fork; omitted on restart to reuse the original name." })),
+      task: Type.String(),
+    }),
+    async execute(_id: string, params: any, _signal: AbortSignal, _update: any, ctx: any) {
+      const sourceName = params.name.trim();
+      const targetName = mode === "fork" ? params.newName?.trim() : sourceName;
+      if (!targetName) return { content: [{ type: "text", text: "`newName` is required when forking a subagent." }], details: { error: "newName required" } };
+      const { running, entry, artifactDir } = resolveSessionByName(sourceName, ctx);
+      if (running) return { content: [{ type: "text", text: `Subagent "${sourceName}" is still running; cancel or wait for it first.` }], details: { error: "still running" } };
+      if (!entry?.sessionFile || !existsSync(entry.sessionFile)) return { content: [{ type: "text", text: `No readable subagent named "${sourceName}".` }], details: { error: "not found" } };
+      if (mode === "fork" && (readNameRegistry(artifactDir)[targetName] || Array.from(runningSubagents.values()).some((item) => item.name === targetName))) {
+        return { content: [{ type: "text", text: `Subagent name "${targetName}" is already in use.` }], details: { error: "name exists" } };
+      }
+      const loadout = readSubagentLoadout(entry.sessionFile);
+      if (!loadout) return { content: [{ type: "text", text: `No sandbox loadout found for "${sourceName}".` }], details: { error: "no loadout" } };
+      const cloned = await cloneNativeSubagent(targetName, params.task, entry.sessionFile, loadout, mode, ctx);
+      registerName(artifactDir, targetName, { sessionFile: cloned.sessionFile, sessionId: getSessionId(cloned.sessionFile) });
+      superviseClone(cloned, targetName, params.task);
+      return { content: [{ type: "text", text: `Subagent "${targetName}" ${mode === "fork" ? "forked" : "restarted"}.` }], details: { name: targetName, status: "started", sessionFile: cloned.sessionFile } };
+    },
+  } as any);
+  registerCloneTool("restart");
+  registerCloneTool("fork");
+
+  pi.registerTool({
+    name: "subagent_diagnostics",
+    label: "Subagent Diagnostics",
+    description: "Inspect structured runtime, transcript, sandbox, activity, event, and sidecar diagnostics for one subagent.",
+    parameters: Type.Object({ name: Type.String() }),
+    async execute(_id, params, _signal, _update, ctx) {
+      const { running, entry } = resolveSessionByName(params.name.trim(), ctx);
+      if (!entry?.sessionFile) return { content: [{ type: "text", text: `No subagent named "${params.name}".` }], details: { error: "not found" } };
+      const sessionFile = entry.sessionFile;
+      const diagnostics = {
+        name: params.name,
+        running: !!running,
+        streaming: !!(running?.native?.session as any)?.isStreaming,
+        cancelled: !!running?.cancelled,
+        sessionFile,
+        sessionExists: existsSync(sessionFile),
+        loadoutExists: !!readSubagentLoadout(sessionFile),
+        pendingQuestion: existsSync(`${sessionFile}.ask`),
+        exitSidecar: existsSync(`${sessionFile}.exit`),
+        activity: running?.activity ?? null,
+        activityRead: running?.activityRead ?? null,
+        stats: existsSync(sessionFile) ? summarizeSessionStats(sessionFile) : null,
+        events: readSubagentEvents(sessionFile),
+      };
+      return { content: [{ type: "text", text: JSON.stringify(diagnostics, null, 2) }], details: diagnostics };
+    },
+  });
+
   pi.registerTool({
       name: "subagent_list",
       label: "List Subagents",

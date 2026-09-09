@@ -32,6 +32,34 @@ export interface MessageEntry extends SessionEntry {
 
 export type SeededSubagentSessionMode = "lineage-only" | "fork";
 
+export interface SubagentEvent {
+  type: "progress" | "artifact";
+  timestamp: string;
+  message?: string;
+  percent?: number;
+  path?: string;
+  description?: string;
+}
+
+export function subagentEventsPath(sessionFile: string): string {
+  return `${sessionFile}.events.jsonl`;
+}
+
+export function appendSubagentEvent(sessionFile: string, event: SubagentEvent): void {
+  appendFileSync(subagentEventsPath(sessionFile), `${JSON.stringify(event)}\n`, "utf8");
+}
+
+export function readSubagentEvents(sessionFile: string): SubagentEvent[] {
+  try {
+    return readFileSync(subagentEventsPath(sessionFile), "utf8")
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as SubagentEvent);
+  } catch {
+    return [];
+  }
+}
+
 function getForkContentLines(parentSessionFile: string): string[] {
   const raw = readFileSync(parentSessionFile, "utf8");
   const lines = raw.split("\n").filter((line) => line.trim());
@@ -78,6 +106,30 @@ export function seedSubagentSessionFile(params: {
 
   mkdirSync(dirname(params.childSessionFile), { recursive: true });
   writeFileSync(params.childSessionFile, lines.join("\n") + "\n", "utf8");
+}
+
+/** Create a child session containing the complete transcript of another child. */
+export function forkSubagentSessionFile(params: {
+  sourceSessionFile: string;
+  childSessionFile: string;
+  childCwd: string;
+}): void {
+  const contentLines = readFileSync(params.sourceSessionFile, "utf8")
+    .split("\n")
+    .filter((line) => line.trim())
+    .filter((line) => {
+      try { return JSON.parse(line).type !== "session"; } catch { return false; }
+    });
+  const header = {
+    type: "session",
+    version: 3,
+    id: randomUUID(),
+    timestamp: new Date().toISOString(),
+    cwd: params.childCwd,
+    parentSession: params.sourceSessionFile,
+  };
+  mkdirSync(dirname(params.childSessionFile), { recursive: true });
+  writeFileSync(params.childSessionFile, [JSON.stringify(header), ...contentLines].join("\n") + "\n", "utf8");
 }
 
 /**

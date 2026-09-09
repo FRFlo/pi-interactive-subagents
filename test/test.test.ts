@@ -27,6 +27,9 @@ import {
   copySessionFile,
   mergeNewEntries,
   seedSubagentSessionFile,
+  forkSubagentSessionFile,
+  appendSubagentEvent,
+  readSubagentEvents,
   summarizeSessionStats,
 } from "../pi-extension/subagents/session.ts";
 
@@ -53,6 +56,7 @@ import {
   shouldAutoExitOnAgentEnd,
   findLatestAssistantError,
   runningChildrenCount,
+  createSubagentDoneExtension,
 } from "../pi-extension/subagents/subagent-done.ts";
 import subagentDoneExtension from "../pi-extension/subagents/subagent-done.ts";
 
@@ -269,6 +273,29 @@ describe("session.ts", () => {
       assert.equal(countSessionEntryLines(file), 1);
       assert.equal(countSessionEntryLines(join(dir, "does-not-exist.jsonl")), 0);
     });
+  });
+
+  describe("subagent events and full transcript forks", () => {
+    it("persists progress and artifact events in order", () => withTempDir((dir) => {
+      const session = join(dir, "child.jsonl");
+      appendSubagentEvent(session, { type: "progress", timestamp: "2026-01-01T00:00:00Z", message: "Halfway", percent: 50 });
+      appendSubagentEvent(session, { type: "artifact", timestamp: "2026-01-01T00:01:00Z", path: join(dir, "report.md") });
+      assert.deepEqual(readSubagentEvents(session).map((event) => event.type), ["progress", "artifact"]);
+    }));
+
+    it("forks the complete source transcript under a new session header", () => withTempDir((dir) => {
+      const source = createSessionFile(dir, [
+        { type: "session", id: "source", version: 3, cwd: dir },
+        { type: "message", id: "u1", message: { role: "user", content: [{ type: "text", text: "task" }] } },
+        { type: "message", id: "a1", parentId: "u1", message: { role: "assistant", content: [{ type: "text", text: "done" }] } },
+      ]);
+      const child = join(dir, "fork.jsonl");
+      forkSubagentSessionFile({ sourceSessionFile: source, childSessionFile: child, childCwd: dir });
+      const entries = getNewEntries(child, 0);
+      assert.notEqual(entries[0].id, "source");
+      assert.equal((entries[0] as any).parentSession, source);
+      assert.deepEqual(entries.slice(1).map((entry) => entry.id), ["u1", "a1"]);
+    }));
   });
 
   describe("getSessionId / resolveSessionFileById", () => {
@@ -1507,12 +1534,35 @@ describe("subagent-done.ts", () => {
       try {
         const names = mock.registeredTools.map((t) => t.name);
         assert.ok(names.includes("ask_question"));
+        assert.ok(names.includes("report_progress"));
+        assert.ok(names.includes("publish_artifact"));
         assert.ok(!names.includes("caller_ping"));
         const tool = mock.registeredTools.find((t) => t.name === "ask_question");
         assert.deepEqual(Object.keys(tool.parameters.properties), ["question"]);
         assert.match(tool.description, /orchestrator/i);
       } finally {
         restore();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("report_progress and publish_artifact persist parent-readable events", async () => {
+      const dir = createTestDir();
+      const sessionFile = join(dir, "s.jsonl");
+      const artifact = join(dir, "report.md");
+      writeFileSync(artifact, "report");
+      const mock = createMockExtensionApi();
+      createSubagentDoneExtension({ sessionFile, name: "worker", agent: "worker", cwd: dir })(mock.api);
+      try {
+        const progress = mock.registeredTools.find((tool) => tool.name === "report_progress");
+        const publish = mock.registeredTools.find((tool) => tool.name === "publish_artifact");
+        await progress.execute("p1", { message: "Tests ready", percent: 75 });
+        await publish.execute("a1", { path: "report.md", description: "Results" });
+        const events = readSubagentEvents(sessionFile);
+        assert.deepEqual(events.map((event) => event.type), ["progress", "artifact"]);
+        assert.equal(events[0].percent, 75);
+        assert.equal(events[1].path, artifact);
+      } finally {
         rmSync(dir, { recursive: true, force: true });
       }
     });
@@ -1984,8 +2034,80 @@ describe("subagent interruption", () => {
     assert.equal(names.includes("subagent_message"), true);
     assert.equal(names.includes("subagent_read"), true);
     assert.equal(names.includes("subagent_list"), true);
+    for (const name of [
+      "subagent_cancel",
+      "subagent_transcript",
+      "subagent_tools",
+      "subagent_fork",
+      "subagent_restart",
+      "subagent_diagnostics",
+    ]) assert.equal(names.includes(name), true, `expected ${name} to be registered`);
     assert.equal(names.includes("subagent_interrupt"), false);
     assert.equal(names.includes("subagent_resume"), false);
+  });
+
+  it("subagent_cancel aborts a running native session", async () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    runningMap.clear();
+    let aborted = false;
+    const controller = new AbortController();
+    runningMap.set("a1", makeRunning({
+      abortController: controller,
+      native: { session: { abort: async () => { aborted = true; } } },
+    }));
+    try {
+      const { api, registeredTools } = createMockExtensionApi();
+      (subagentsModule as any).default(api);
+      const tool = registeredTools.find((candidate) => candidate.name === "subagent_cancel");
+      const result = await tool.execute("cancel-1", { name: "Worker" });
+      assert.equal(aborted, true);
+      assert.equal(controller.signal.aborted, true);
+      assert.equal(runningMap.get("a1").cancelled, true);
+      assert.match(result.content[0].text, /cancelled/i);
+    } finally {
+      runningMap.clear();
+    }
+  });
+
+  it("reads transcript, loadout, and structured diagnostics for a finished session", async () => {
+    const dir = createTestDir();
+    const sessionId = "parent-id";
+    const artifactDir = join(dir, "artifacts", sessionId);
+    mkdirSync(artifactDir, { recursive: true });
+    const child = join(dir, "child.jsonl");
+    writeFileSync(child, [
+      JSON.stringify({ type: "session", id: "child-id", version: 3, cwd: dir }),
+      JSON.stringify({ type: "message", id: "u1", message: { role: "user", content: [{ type: "text", text: "hello" }] } }),
+      JSON.stringify({ type: "message", id: "a1", message: { role: "assistant", content: [{ type: "text", text: "world" }] } }),
+    ].join("\n") + "\n");
+    const loadout: SubagentLoadout = {
+      agent: "scout", toolAllowlist: "read", model: null, thinking: null,
+      systemPromptMode: null, identity: null, spawnable: null, autoExit: true,
+      cwd: dir, agentDir: dir,
+    };
+    writeSubagentLoadout(child, loadout);
+    registerName(artifactDir, "Scout", { sessionFile: child, sessionId: "child-id" });
+    appendSubagentEvent(child, { type: "progress", timestamp: new Date().toISOString(), message: "done" });
+    const ctx = { sessionManager: { getSessionDir: () => dir, getSessionId: () => sessionId } };
+    try {
+      const { api, registeredTools } = createMockExtensionApi();
+      (subagentsModule as any).default(api);
+      const transcript = await registeredTools.find((tool) => tool.name === "subagent_transcript")
+        .execute("t1", { name: "Scout", limit: 1 }, undefined, undefined, ctx);
+      assert.equal(transcript.details.messages.length, 1);
+      assert.equal(transcript.details.messages[0].text, "world");
+      assert.equal(transcript.details.nextBefore, "a1");
+      const tools = await registeredTools.find((tool) => tool.name === "subagent_tools")
+        .execute("t2", { name: "Scout" }, undefined, undefined, ctx);
+      assert.equal(tools.details.loadout.toolAllowlist, "read");
+      const diagnostics = await registeredTools.find((tool) => tool.name === "subagent_diagnostics")
+        .execute("t3", { name: "Scout" }, undefined, undefined, ctx);
+      assert.equal(diagnostics.details.sessionExists, true);
+      assert.equal(diagnostics.details.events[0].type, "progress");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it("resolves a running subagent by exact name and reports ambiguity", () => {
