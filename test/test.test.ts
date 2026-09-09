@@ -1,4 +1,4 @@
-import { describe, it, before, after, beforeEach } from "node:test";
+import { describe, it, beforeAll, afterAll, beforeEach } from "bun:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync, existsSync } from "node:fs";
 import { join } from "node:path";
@@ -30,7 +30,6 @@ import {
   summarizeSessionStats,
 } from "../pi-extension/subagents/session.ts";
 
-import { shellEscape } from "../pi-extension/subagents/tmux.ts";
 import {
   advanceStatusState,
   capStatusLines,
@@ -56,7 +55,6 @@ import {
   runningChildrenCount,
 } from "../pi-extension/subagents/subagent-done.ts";
 import subagentDoneExtension from "../pi-extension/subagents/subagent-done.ts";
-import { __pollForExitTest__ } from "../pi-extension/subagents/tmux.ts";
 
 // --- Helpers ---
 
@@ -223,11 +221,11 @@ const TOOL_RESULT = {
 describe("session.ts", () => {
   let dir: string;
 
-  before(() => {
+  beforeAll(() => {
     dir = createTestDir();
   });
 
-  after(() => {
+  afterAll(() => {
     rmSync(dir, { recursive: true, force: true });
   });
 
@@ -632,7 +630,7 @@ describe("session.ts", () => {
     it("aggregates tokens/cost cumulatively and tracks last context size", () => {
       const file = createSessionFile(dir, [
         SESSION_HEADER,
-        { type: "model_change", id: "mc-001", parentId: null, modelId: "claude-sonnet-4-6" },
+        { type: "model_change", id: "mc-001", parentId: null, modelId: "gemini-2.5-pro" },
         USER_MSG,
         asstWithUsage("a1", {
           tools: ["read", "grep"],
@@ -644,7 +642,7 @@ describe("session.ts", () => {
         }),
       ]);
       const stats = summarizeSessionStats(file)!;
-      assert.equal(stats.model, "claude-sonnet-4-6");
+      assert.equal(stats.model, "gemini-2.5-pro");
       assert.equal(stats.toolCount, 3);
       assert.equal(stats.inputTokens, 130);
       assert.equal(stats.outputTokens, 120);
@@ -658,10 +656,10 @@ describe("session.ts", () => {
     it("prefers per-message model over model_change", () => {
       const file = createSessionFile(dir, [
         SESSION_HEADER,
-        { type: "model_change", id: "mc-001", parentId: null, modelId: "claude-haiku-4-5" },
-        asstWithUsage("a1", { model: "claude-sonnet-4-6", usage: { totalTokens: 10, cost: { total: 0 } } }),
+        { type: "model_change", id: "mc-001", parentId: null, modelId: "gemini-2.0-flash" },
+        asstWithUsage("a1", { model: "gemini-2.5-pro", usage: { totalTokens: 10, cost: { total: 0 } } }),
       ]);
-      assert.equal(summarizeSessionStats(file)!.model, "claude-sonnet-4-6");
+      assert.equal(summarizeSessionStats(file)!.model, "gemini-2.5-pro");
     });
 
     it("handles missing usage gracefully", () => {
@@ -809,14 +807,6 @@ describe("status.ts", () => {
     const snapshot = classifyStatus(state, 240_000);
     assert.equal(snapshot.kind, "waiting");
     assert.equal(snapshot.waitingDurationText, "3m");
-  });
-
-  it("uses elapsed-only fallback for claude-backed subagents", () => {
-    const state = createStatusState({ source: "claude", startTimeMs: 0 });
-    const snapshot = classifyStatus(state, 125_000);
-
-    assert.equal(snapshot.kind, "running");
-    assert.equal(snapshot.elapsedText, "2m");
   });
 
   it("detects stalled transitions and recovery", () => {
@@ -1275,87 +1265,6 @@ describe("subagent discovery", () => {
     assert.equal(testApi.buildSubagentToolAllowlist(""), null);
   });
 
-  it("applySandboxToParts replays model, identity, and default-deny tool restriction", () => {
-    withTempDir((d) => {
-      const parts: string[] = [];
-      testApi.applySandboxToParts(
-        parts,
-        {
-          agent: "worker",
-          toolAllowlist: "read,write,safe_bash",
-          model: "openrouter/z-ai/glm-5.2",
-          thinking: "medium",
-          systemPromptMode: "append",
-          identity: "You are a worker.",
-          spawnable: ["scout"],
-          autoExit: true,
-          cwd: null,
-          agentDir: null,
-        },
-        { artifactDir: d, name: "worker" },
-      );
-      const joined = parts.join(" ");
-      // Model with thinking suffix.
-      assert.ok(joined.includes("--model"), "expected --model");
-      assert.ok(joined.includes("openrouter/z-ai/glm-5.2:medium"), "expected model:thinking");
-      // Identity written to a file and appended.
-      assert.ok(joined.includes("--append-system-prompt"), "expected --append-system-prompt");
-      // Default-deny restriction.
-      assert.ok(parts.includes("--no-extensions"), "expected --no-extensions");
-      const toolsIdx = parts.indexOf("--tools");
-      assert.ok(toolsIdx >= 0, "expected --tools");
-      // The value is shell-escaped (single-quoted) before joining.
-      assert.ok(
-        parts[toolsIdx + 1].includes("read,write,safe_bash"),
-        "expected the tool allowlist as the --tools value",
-      );
-    });
-  });
-
-  it("applySandboxToParts omits restriction flags when the loadout was unrestricted", () => {
-    withTempDir((d) => {
-      const parts: string[] = [];
-      testApi.applySandboxToParts(
-        parts,
-        {
-          agent: null,
-          toolAllowlist: null,
-          model: null,
-          thinking: null,
-          systemPromptMode: null,
-          identity: null,
-          spawnable: null,
-          autoExit: false,
-          cwd: null,
-          agentDir: null,
-        },
-        { artifactDir: d, name: "fork" },
-      );
-      assert.deepEqual(parts, []);
-    });
-  });
-
-  it("buildPiPromptArgs inserts separator for artifact-backed launches with skills", () => {
-    assert.deepEqual(
-      testApi.buildPiPromptArgs({ effectiveSkills: "review,lint", taskDelivery: "artifact", taskArg: "@artifact.md" }),
-      ["", "/skill:review", "/skill:lint", "@artifact.md"],
-    );
-  });
-
-  it("buildPiPromptArgs omits separator for artifact-backed launches without skills", () => {
-    assert.deepEqual(
-      testApi.buildPiPromptArgs({ effectiveSkills: undefined, taskDelivery: "artifact", taskArg: "@artifact.md" }),
-      ["@artifact.md"],
-    );
-  });
-
-  it("buildPiPromptArgs omits separator for direct launches with skills", () => {
-    assert.deepEqual(
-      testApi.buildPiPromptArgs({ effectiveSkills: "review", taskDelivery: "direct", taskArg: "do the task" }),
-      ["/skill:review", "do the task"],
-    );
-  });
-
   it("lists visible agents from discovery", async () => {
     await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
       writeAgentFile(
@@ -1732,52 +1641,6 @@ describe("subagent-done.ts", () => {
   });
 });
 
-describe("tmux.ts interpretExitSidecar", () => {
-  const { interpretExitSidecar } = __pollForExitTest__;
-
-  it("no longer decodes ping payloads (ask_question keeps the session open instead)", () => {
-    // ask_question writes a `.ask` signal, not a `.exit` ping sidecar, so an
-    // unknown `type: "ping"` payload now falls through to a clean done.
-    assert.deepEqual(
-      interpretExitSidecar({ type: "ping", name: "Worker", message: "need help" }),
-      { reason: "done", exitCode: 0 },
-    );
-  });
-
-  it("decodes done payloads", () => {
-    assert.deepEqual(interpretExitSidecar({ type: "done" }), {
-      reason: "done",
-      exitCode: 0,
-    });
-  });
-
-  it("decodes error payloads and propagates the message with a non-zero exit code", () => {
-    assert.deepEqual(
-      interpretExitSidecar({
-        type: "error",
-        errorMessage: "Anthropic 529 Overloaded after 3 retries",
-        stopReason: "error",
-      }),
-      {
-        reason: "error",
-        exitCode: 1,
-        errorMessage: "Anthropic 529 Overloaded after 3 retries",
-      },
-    );
-  });
-
-  it("falls back to a placeholder when error payload has no errorMessage", () => {
-    const result = interpretExitSidecar({ type: "error" });
-    assert.equal(result.reason, "error");
-    assert.equal(result.exitCode, 1);
-    assert.match(result.errorMessage ?? "", /no errorMessage/);
-  });
-
-  it("treats unknown payload shapes as done", () => {
-    assert.deepEqual(interpretExitSidecar({}), { reason: "done", exitCode: 0 });
-    assert.deepEqual(interpretExitSidecar(null), { reason: "done", exitCode: 0 });
-  });
-});
 describe("commands", () => {
   it("/subagent emits a spawn tool call for a known agent", () => {
     const { api, registeredCommands, sentUserMessages } = createMockExtensionApi();
@@ -2099,7 +1962,6 @@ describe("subagent interruption", () => {
       id: "a1",
       name: "Worker",
       task: "",
-      surface: "pane-1",
       startTime: 0,
       sessionFile: "worker.jsonl",
       native: {
@@ -2130,9 +1992,9 @@ describe("subagent interruption", () => {
     runningMap.clear();
 
     try {
-      runningMap.set("a1", makeRunning({ id: "a1", name: "Worker", surface: "a1", sessionFile: "a1.jsonl" }));
-      runningMap.set("b2", makeRunning({ id: "b2", name: "Worker", surface: "b2", sessionFile: "b2.jsonl" }));
-      runningMap.set("c3", makeRunning({ id: "c3", name: "Scout", surface: "c3", sessionFile: "c3.jsonl" }));
+      runningMap.set("a1", makeRunning({ id: "a1", name: "Worker", sessionFile: "a1.jsonl" }));
+      runningMap.set("b2", makeRunning({ id: "b2", name: "Worker", sessionFile: "b2.jsonl" }));
+      runningMap.set("c3", makeRunning({ id: "c3", name: "Scout", sessionFile: "c3.jsonl" }));
 
       const byName = testApi.resolveRunningByName("Scout");
       assert.equal(byName.running.id, "c3");
@@ -2156,10 +2018,10 @@ describe("subagent interruption", () => {
       // No collision: base name is returned untouched.
       assert.equal(testApi.uniqueRunningName("worker"), "worker");
 
-      runningMap.set("a1", makeRunning({ id: "a1", name: "worker", surface: "a1" }));
+      runningMap.set("a1", makeRunning({ id: "a1", name: "worker" }));
       assert.equal(testApi.uniqueRunningName("worker"), "worker-2");
 
-      runningMap.set("b2", makeRunning({ id: "b2", name: "worker-2", surface: "b2" }));
+      runningMap.set("b2", makeRunning({ id: "b2", name: "worker-2" }));
       assert.equal(testApi.uniqueRunningName("worker"), "worker-3");
 
       // A distinct base is unaffected by the worker collisions.
@@ -2462,37 +2324,6 @@ describe("subagent status renderer", () => {
   });
 });
 
-describe("subagent startup delay", () => {
-  it("defaults to 500ms when no env var is set", () => {
-    const testApi = (subagentsModule as any).__test__;
-    assert.ok(testApi, "expected subagents test helpers to be exported");
-    assert.equal(typeof testApi.getShellReadyDelayMs, "function");
-
-    const original = process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS;
-    delete process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS;
-    try {
-      assert.equal(testApi.getShellReadyDelayMs(), 500);
-    } finally {
-      if (original == null) delete process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS;
-      else process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = original;
-    }
-  });
-
-  it("uses PI_SUBAGENT_SHELL_READY_DELAY_MS when it is set", () => {
-    const testApi = (subagentsModule as any).__test__;
-    assert.ok(testApi, "expected subagents test helpers to be exported");
-    assert.equal(typeof testApi.getShellReadyDelayMs, "function");
-
-    const original = process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS;
-    process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = "2500";
-    try {
-      assert.equal(testApi.getShellReadyDelayMs(), 2500);
-    } finally {
-      if (original == null) delete process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS;
-      else process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = original;
-    }
-  });
-});
 describe("subagents widget rendering", () => {
   it("keeps every rendered line within a very narrow width", () => {
     const testApi = (subagentsModule as any).__test__;
@@ -2507,7 +2338,6 @@ describe("subagents widget rendering", () => {
           id: "a1",
           name: "A",
           task: "",
-          surface: "s1",
           startTime: 1_000_000 - 13_000,
           sessionFile: "sess1",
           statusState: createStatusState({ source: "pi", startTimeMs: 1_000_000 - 13_000 }),
@@ -2516,7 +2346,6 @@ describe("subagents widget rendering", () => {
           id: "a2",
           name: "B",
           task: "",
-          surface: "s2",
           startTime: 1_000_000 - 21_000,
           sessionFile: "sess2",
           statusState: createStatusState({ source: "pi", startTimeMs: 1_000_000 - 21_000 }),
@@ -2525,7 +2354,6 @@ describe("subagents widget rendering", () => {
           id: "a3",
           name: "C",
           task: "",
-          surface: "s3",
           startTime: 1_000_000 - 27_000,
           sessionFile: "sess3",
           statusState: createStatusState({ source: "pi", startTimeMs: 1_000_000 - 27_000 }),
@@ -2563,7 +2391,6 @@ describe("subagents widget rendering", () => {
           id: "a1",
           name: "A",
           task: "",
-          surface: "s1",
           startTime,
           sessionFile: "sess1",
           statusState: createStatusState({ source: "pi", startTimeMs: startTime }),
@@ -2593,7 +2420,6 @@ describe("subagent display helpers", () => {
 
   describe("contextWindowFor", () => {
     it("maps known model families and returns undefined otherwise", () => {
-      assert.equal(testApi.contextWindowFor("claude-sonnet-4-6"), 200_000);
       assert.equal(testApi.contextWindowFor("gemini-2.5-pro"), 1_000_000);
       assert.equal(testApi.contextWindowFor("some-unknown-model"), undefined);
       assert.equal(testApi.contextWindowFor(null), undefined);
@@ -2614,7 +2440,7 @@ describe("subagent display helpers", () => {
   describe("formatUsageSegments", () => {
     it("emits arrow/cache/cost segments, skipping zero fields", () => {
       const segs = testApi.formatUsageSegments({
-        model: "claude-sonnet-4-6",
+        model: "gemini-2.5-pro",
         toolCount: 3,
         inputTokens: 3200,
         outputTokens: 890,
@@ -2655,27 +2481,3 @@ describe("subagent display helpers", () => {
   });
 });
 
-describe("tmux.ts", () => {
-  describe("shellEscape", () => {
-    it("wraps in single quotes", () => {
-      assert.equal(shellEscape("hello"), "'hello'");
-    });
-
-    it("escapes single quotes", () => {
-      assert.equal(shellEscape("it's"), "'it'\\''s'");
-    });
-
-    it("handles empty string", () => {
-      assert.equal(shellEscape(""), "''");
-    });
-
-    it("handles special characters", () => {
-      const input = 'echo "hello $world" && rm -rf /';
-      const escaped = shellEscape(input);
-      assert.ok(escaped.startsWith("'"));
-      assert.ok(escaped.endsWith("'"));
-      // Inside single quotes, everything is literal
-      assert.ok(escaped.includes("$world"));
-    });
-  });
-});

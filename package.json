@@ -13,8 +13,8 @@
   },
   "type": "module",
   "scripts": {
-    "test": "node --test test/test.ts",
-    "test:integration": "node --test --test-concurrency=1 test/integration/*.test.ts"
+    "test": "bun test test/test.test.ts",
+    "test:integration": "bun test --max-concurrency=1 test/integration/native-session.test.ts"
   },
   "peerDependencies": {
     "@mariozechner/pi-coding-agent": "*",

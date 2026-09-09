@@ -39,7 +39,7 @@ subagent({ agent: "worker", name: "dark-mode", task: "Implement the dark mode to
 | --------- | ---- | ------- | ----------- |
 | `agent` | string | required | Which agent to spawn (must be known and permitted) |
 | `task` | string | required | Task prompt |
-| `name` | string | agent name | Display name for the pane and widget. Must be unique — duplicates are auto-suffixed (`scout`, `scout-2`, …) |
+| `name` | string | agent name | Display name for the subagent and widget. Must be unique — duplicates are auto-suffixed (`scout`, `scout-2`, …) |
 | `model` | string | agent's model | Override the model for this spawn |
 | `cwd` | string | agent's `cwd` | Working directory (see [Role folders](#role-folders)) |
 
@@ -62,7 +62,7 @@ Every spawn records name → session file in `artifacts/<sessionId>/subagent-reg
 
 A sub-agent can ask its orchestrator a single freeform question when requirements are ambiguous or a decision materially affects the work. The session **stays open** (parked as `waiting`) instead of exiting; the parent is notified with the sub-agent's name, replies via `subagent_message({ name, message })`, and the reply arrives as the sub-agent's next turn. Parallel questions are supported — each waiting sub-agent has its own name.
 
-If the reply arrives while the sub-agent is still mid-turn, it is absorbed into the current turn — either way the question is marked answered and the session exits normally when the work is done. If the parent never replies, the pane stays open until a human closes it. Only available inside sub-agent sessions.
+If the reply arrives while the sub-agent is still mid-turn, it is absorbed into the current turn — either way the question is marked answered and the session exits normally when the work is done. If the parent never replies, the session stays open until it is resumed. Only available inside sub-agent sessions.
 
 ## Bundled agents
 
@@ -104,12 +104,11 @@ You are a specialized agent that does X...
 | `subagent_agents` | string | Comma-separated agent names this agent may spawn. **Presence of this field grants the spawning toolset** (`subagent`, `subagent_message`, `subagents_list`) and restricts spawn targets to the list. Omit it and the agent cannot spawn at all |
 | `skills` | string | Comma-separated skill names to auto-load |
 | `session-mode` | string | `standalone` (default), `lineage-only`, or `fork` — see below |
-| `system-prompt` | string | `append` or `replace`: pass the body as the child's `--append-system-prompt` / `--system-prompt`. Omit and the body is prepended to the task prompt instead |
+| `system-prompt` | string | `append` or `replace`: control how the agent body is applied to the native session prompt |
 | `auto-exit` | boolean | Auto-shutdown when the agent finishes (see below) |
 | `interactive` | boolean | Whether stall/recovery transitions wake the parent (see below) |
 | `cwd` | string | Default working directory |
 | `disable-model-invocation` | boolean | Hide from `subagents_list`; still spawnable by explicit name |
-| `cli` | string | `claude` runs the agent via the Claude Code CLI instead of pi |
 
 ### session-mode
 
@@ -123,16 +122,16 @@ With `auto-exit: true`, the session shuts down when the agent's turn ends — th
 
 Notes:
 
-- **Manual input does not strand an auto-exit sub-agent.** If a human types into the pane, the session still closes once that turn completes normally — only an escape/abort leaves it open.
+- **Manual input does not strand an auto-exit sub-agent.** If a human focuses the session, it still closes once that turn completes normally — only an escape/abort leaves it open.
 - **Auto-exit is suppressed while work is in flight:** the session parks as `waiting` instead of exiting when an `ask_question` is still unanswered, or when the agent's own child sub-agents are still running (a worker can stop after dispatching children and stays open until the last result returns).
 
 ### interactive
 
-Controls whether `stalled`/`recovered` status transitions send a steer message to the parent session. Defaults to the inverse of `auto-exit`: autonomous agents get stall pings; user-driven agents stay quiet (the user is already working in that pane — the widget still updates). Set explicitly to override.
+Controls whether `stalled`/`recovered` status transitions send a steer message to the parent session. Defaults to the inverse of `auto-exit`: autonomous agents get stall pings; user-driven agents stay quiet (the user is already working in that session — the widget still updates). Set explicitly to override.
 
 ## Tool access control
 
-Access is **whitelist-only**. Every sub-agent process is launched with `--no-extensions` (extension discovery disabled) and `--tools <allowlist>`; only the extensions backing the listed tools are loaded back in explicitly. There is no default toolset and no deny-list — an agent gets exactly what its frontmatter lists. The restriction survives resume via the loadout snapshot.
+Access is **whitelist-only**. Each native sub-agent session receives only the tools listed in its profile. There is no default toolset and no deny-list — an agent gets exactly what its frontmatter lists. The restriction survives resume via the loadout snapshot.
 
 Spawns must name a known agent at **every** depth. A top-level session may spawn anything discoverable; a sub-agent may only spawn the agents in its `subagent_agents` list (enforced via `PI_SUBAGENT_ALLOWED`). There is no agentless spawn route, so a child can never escalate to a full-toolset profile by omitting its agent.
 
@@ -140,13 +139,13 @@ Extensions can register additional tools for sub-agents at runtime via `register
 
 ## Role folders
 
-`cwd` starts a sub-agent in a directory with its own config, so role-specific setups (CLAUDE.md, skills, extensions) apply:
+`cwd` starts a sub-agent in a directory with its own config, so role-specific setups (agent instructions, skills, extensions) apply:
 
 ```
 project/
 └── agents/
-    ├── game-designer/   ← CLAUDE.md, .pi/…
-    └── sre/             ← CLAUDE.md, .pi/…
+    ├── game-designer/   ← agent instructions, .pi/…
+    └── sre/             ← agent instructions, .pi/…
 ```
 
 ```typescript
@@ -170,15 +169,11 @@ Status display is configured via `config.json` in the extension directory (copy 
 ## Requirements
 
 - [pi](https://github.com/badlogic/pi-mono)
-- [tmux](https://github.com/tmux/tmux)
-
-```bash
-tmux new -A -s pi 'pi'
-```
+- pi running in its normal terminal session
 
 ## Acknowledgements
 
-Forked from [HazAT/pi-interactive-subagents](https://github.com/HazAT/pi-interactive-subagents), which originated the subagent architecture, the multi-multiplexer surface layer, and the status widget; its supervision features were inspired by [RepoPrompt](https://repoprompt.com/).
+Forked from [HazAT/pi-interactive-subagents](https://github.com/HazAT/pi-interactive-subagents), which originated the subagent architecture and status widget; its supervision features were inspired by [RepoPrompt](https://repoprompt.com/).
 
 ## License
 
