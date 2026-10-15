@@ -89,6 +89,14 @@ const SubagentParams = Type.Object({
       "Which agent to spawn (e.g. 'worker', 'scout', 'researcher'). This loads the agent's " +
       "fixed profile — its model, tool loadout, and system prompt. Must be one of the available agents.",
   }),
+  profile: Type.Optional(Type.Union([
+    Type.Literal("search"),
+    Type.Literal("review"),
+    Type.Literal("research"),
+    Type.Literal("implementation"),
+    Type.Literal("refactor"),
+    Type.Literal("test"),
+  ], { description: "Task profile: search, review, research, implementation, refactor, or test." })),
   task: Type.String({ description: "Task/prompt for the sub-agent" }),
   name: Type.Optional(
     Type.String({
@@ -105,6 +113,59 @@ const SubagentParams = Type.Object({
     }),
   ),
 });
+
+type TaskProfileName = "search" | "review" | "research" | "implementation" | "refactor" | "test";
+interface TaskProfile {
+  description: string;
+  tools: string[];
+  instructions: string;
+  readOnly?: boolean;
+}
+
+const TASK_PROFILES: Record<TaskProfileName, TaskProfile> = {
+  search: {
+    description: "Read-only codebase search and architecture tracing",
+    tools: ["read", "grep", "find", "ls"],
+    readOnly: true,
+    instructions: "TASK PROFILE: SEARCH. Investigate without modifying files. Cite exact paths and relevant symbols/locations. Report findings and unresolved questions.",
+  },
+  review: {
+    description: "Read-only code review and risk analysis",
+    tools: ["read", "grep", "find", "ls"],
+    readOnly: true,
+    instructions: "TASK PROFILE: REVIEW. Do not modify files. Prioritize concrete defects and risks; support each finding with a file/location and explain its impact. Report checks performed.",
+  },
+  research: {
+    description: "External or technical research",
+    tools: ["web_search", "web_fetch", "read", "grep", "find", "ls"],
+    readOnly: true,
+    instructions: "TASK PROFILE: RESEARCH. Distinguish verified facts from assumptions and include source URLs or repository evidence. Synthesize the answer rather than listing raw search results.",
+  },
+  implementation: {
+    description: "Implement a bounded feature or change",
+    tools: ["read", "grep", "find", "ls", "write", "edit", "bash", "safe_bash"],
+    instructions: "TASK PROFILE: IMPLEMENTATION. Make the requested change within the assigned scope. Run relevant verification and report changed files, behavior, and test results.",
+  },
+  refactor: {
+    description: "Refactor while preserving behavior",
+    tools: ["read", "grep", "find", "ls", "write", "edit", "bash", "safe_bash"],
+    instructions: "TASK PROFILE: REFACTOR. Preserve externally observable behavior. Keep changes focused, inspect callers, and run relevant tests. Report any behavior change separately.",
+  },
+  test: {
+    description: "Add or run tests",
+    tools: ["read", "grep", "find", "ls", "write", "edit", "bash", "safe_bash"],
+    instructions: "TASK PROFILE: TEST. Focus on useful, deterministic coverage of the requested behavior. Run the narrowest relevant tests and report commands and outcomes.",
+  },
+};
+
+function resolveTaskProfile(name: string | undefined): TaskProfile | undefined {
+  return name ? TASK_PROFILES[name as TaskProfileName] : undefined;
+}
+
+function intersectToolLists(agentTools: string | undefined, profileTools: string[]): string {
+  const allowed = agentTools?.split(",").map((tool) => tool.trim()).filter(Boolean);
+  return (allowed ? profileTools.filter((tool) => allowed.includes(tool)) : profileTools).join(",");
+}
 
 type SubagentSessionMode = "standalone" | "lineage-only" | "fork";
 
@@ -1069,11 +1130,16 @@ async function launchNativeSubagent(
   }
 
   const grantSpawning = !!agentDefs?.subagentAgents?.length;
-  const toolAllowlist = buildSubagentToolAllowlist(agentDefs?.tools, { grantSpawning });
+  const profile = resolveTaskProfile(params.profile);
+  const effectiveTools = profile
+    ? intersectToolLists(agentDefs?.tools, profile.tools)
+    : agentDefs?.tools;
+  const toolAllowlist = buildSubagentToolAllowlist(effectiveTools, { grantSpawning });
   const identity = agentDefs?.body;
   const prompt = sessionMode === "fork"
-    ? params.task
+    ? `${profile ? `${profile.instructions}\n\n` : ""}${params.task}`
     : `${identity && !agentDefs?.systemPromptMode ? `\n\n${identity}` : ""}\n\n` +
+      `${profile ? `\n\n${profile.instructions}\n` : ""}` +
       `${params.task}\n\nYour final assistant message should summarize what you accomplished.`;
   const activityFile = getSubagentActivityFile(artifactDir, id);
   mkdirSync(dirname(activityFile), { recursive: true });
@@ -1200,6 +1266,9 @@ export const __test__ = {
   renderSubagentWidgetLines,
   loadAgentDefaults,
   discoverAgentDefinitions,
+  resolveTaskProfile,
+  intersectToolLists,
+  taskProfiles: TASK_PROFILES,
   resolveEffectiveSessionMode,
   resolveLaunchBehavior,
   resolveEffectiveInteractive,
@@ -1485,6 +1554,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       label: "Subagent",
       description:
         "Spawn a sub-agent as an in-process pi session. " +
+        "Choose an optional task profile to classify and constrain the work: search (read-only codebase exploration), review (read-only findings), research (sources and synthesis), implementation, refactor, or test. " +
+        "The profile's tool allowlist is intersected with the selected agent's allowlist; it can never grant extra agent tools. " +
         "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
         "When the sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
         "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT call subagents_list or any other tool to 'check' status. All of that is wasted work — the harness handles delivery for you. " +
@@ -1492,6 +1563,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         "After spawning, either end your turn immediately, or work on other independent tasks (including spawning more subagents in parallel). The harness will wake you with the result when it is ready.",
       promptSnippet:
         "Spawn a sub-agent as an in-process pi session. " +
+        "Choose an optional task profile to classify and constrain the work: search, review, research, implementation, refactor, or test. " +
+        "The profile's tool allowlist is intersected with the selected agent's allowlist; it can never grant extra agent tools. " +
         "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
         "When the sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
         "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT call subagents_list or any other tool to 'check' status. All of that is wasted work — the harness handles delivery for you. " +
@@ -1673,6 +1746,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             name: params.name,
             task: params.task,
             agent: params.agent,
+            profile: params.profile,
             sessionFile: running.sessionFile,
             launchScriptFile: running.launchScriptFile,
             status: "started",
@@ -1692,6 +1766,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // Only show the agent tag separately when a distinct cosmetic name was given.
         const agent =
           agentName && name !== agentName ? theme.fg("dim", ` (${agentName})`) : "";
+        const profileName =
+          typeof partialArgs.profile === "string" ? partialArgs.profile : "";
+        const profileHint = profileName ? theme.fg("accent", ` · ${profileName}`) : "";
         const cwdHint = typeof partialArgs.cwd === "string" && partialArgs.cwd
           ? theme.fg("dim", ` in ${partialArgs.cwd}`)
           : "";
@@ -1699,6 +1776,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           "○ " +
           theme.fg("toolTitle", theme.bold(name)) +
           agent +
+          profileHint +
           cwdHint;
 
         // Show a one-line task preview. renderCall is called repeatedly as the
@@ -1748,11 +1826,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       description:
         "List all available subagent definitions. " +
         "Scans project-local .pi/agents/ and global ~/.pi/agent/agents/. " +
-        "Project-local agents override global ones with the same name.",
+        "Project-local agents override global ones with the same name. " +
+        "Task profiles available to subagent: search, review, research, implementation, refactor, test.",
       promptSnippet:
         "List all available subagent definitions. " +
         "Scans project-local .pi/agents/ and global ~/.pi/agent/agents/. " +
-        "Project-local agents override global ones with the same name.",
+        "Project-local agents override global ones with the same name. " +
+        "Task profiles available to subagent: search, review, research, implementation, refactor, test.",
       parameters: Type.Object({}),
 
       async execute() {

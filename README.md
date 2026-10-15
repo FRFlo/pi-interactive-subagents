@@ -195,13 +195,30 @@ npm run test:e2e
 The complete provider list and cloud-provider setup are documented in Pi's
 [provider guide](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/docs/providers.md).
 
+## Task profiles
+
+Pass an optional `profile` to classify the work independently from the named
+agent. Profiles add a task-specific contract and intersect their tool list with
+the agent's existing allowlist, so a profile never grants tools the agent does
+not already have:
+
+```typescript
+subagent({ agent: "scout", profile: "search", task: "Trace the session setup flow" });
+subagent({ agent: "worker", profile: "refactor", task: "Extract the parser without behavior changes" });
+```
+
+Available profiles: `search`, `review`, `research`, `implementation`, `refactor`,
+and `test`. `search`, `review`, and `research` are read-only. Omit `profile` to
+keep the agent's legacy behavior. The selected Pi model is inherited from the
+parent session rather than hard-coded by the bundled agent definitions.
+
 ## Bundled agents
 
-| Agent | Model | Tools | Role |
-| ----- | ----- | ----- | ---- |
-| **scout** | `openrouter/z-ai/glm-5.3` | `read`, `grep`, `find`, `ls` | Fast read-only codebase recon |
-| **researcher** | `openrouter/z-ai/glm-5.3` | `web_search`, `web_fetch`, `safe_bash` | Web research, synthesized into a sourced brief |
-| **worker** | `openrouter/z-ai/glm-5.3` | `read`, `write`, `edit`, `bash`, `web_search`, `web_fetch` + spawning | General implementer; may spawn `scout` and `researcher` |
+| Agent | Tools | Role |
+| ----- | ----- | ---- |
+| **scout** | `read`, `grep`, `find`, `ls` | Fast read-only codebase recon |
+| **researcher** | `web_search`, `web_fetch`, `safe_bash` | Web research, synthesized into a sourced brief |
+| **worker** | `read`, `write`, `edit`, `bash`, `web_search`, `web_fetch` + spawning | General implementer; may spawn `scout` and `researcher` |
 
 All three are autonomous (`auto-exit: true`) and carry their identity in the system prompt (`system-prompt: append`).
 

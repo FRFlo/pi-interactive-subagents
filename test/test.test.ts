@@ -1083,6 +1083,20 @@ describe("status.ts", () => {
 });
 
 describe("subagent discovery", () => {
+  it("defines task profiles and intersects their tools with agent permissions", () => {
+    const search = testApi.resolveTaskProfile("search");
+    assert.ok(search);
+    assert.equal(search.readOnly, true);
+    assert.deepEqual(
+      testApi.intersectToolLists("read,write,edit,bash", search.tools).split(","),
+      ["read"],
+    );
+    assert.equal(testApi.resolveTaskProfile("unknown"), undefined);
+    assert.deepEqual(Object.keys(testApi.taskProfiles).sort(), [
+      "implementation", "refactor", "research", "review", "search", "test",
+    ]);
+  });
+
   const testApi = (subagentsModule as any).__test__;
 
   it("loads session-mode from frontmatter", async () => {
@@ -1198,6 +1212,14 @@ describe("subagent discovery", () => {
         false,
         `${name} should resolve as non-interactive (autonomous, auto-exit)`,
       );
+    }
+  });
+
+  it("bundled agents no longer pin a model preset", () => {
+    for (const name of ["scout", "researcher", "worker"]) {
+      const defs = testApi.loadAgentDefaults(name);
+      assert.ok(defs);
+      assert.equal(defs.model, undefined);
     }
   });
 
@@ -1754,7 +1776,7 @@ describe("tool registration", () => {
     assert.match(result.content[0].text, /not a known agent/i);
   });
 
-  it("exposes a debloated schema: agent+task required, name/model/cwd optional, no override knobs", () => {
+  it("exposes agent/task plus optional profile, name/model/cwd, no override knobs", () => {
     const { api, registeredTools } = createMockExtensionApi();
     (subagentsModule as any).default(api);
 
@@ -1764,8 +1786,8 @@ describe("tool registration", () => {
     const props = subagentTool.parameters.properties;
     assert.deepEqual(
       Object.keys(props).sort(),
-      ["agent", "cwd", "model", "name", "task"],
-      "only agent/task/name/model/cwd should remain",
+      ["agent", "cwd", "model", "name", "profile", "task"],
+      "only agent/task/profile/name/model/cwd should remain",
     );
     assert.deepEqual(
       [...(subagentTool.parameters.required ?? [])].sort(),
