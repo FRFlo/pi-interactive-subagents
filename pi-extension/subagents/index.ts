@@ -679,10 +679,19 @@ const RUNNING_CHILDREN_COUNT_KEY = Symbol.for("pi-subagents/running-children-cou
 
 /** Latest ExtensionContext from session_start, used for widget updates. */
 let latestCtx: ExtensionContext | null = null;
-/** Latest ExtensionAPI, used to deliver ask_question notifications from the watcher. */
-let latestPi: ExtensionAPI | null = null;
 /** Send method rebound from withSession after session replacement. */
 let sendActiveMessage: ((message: any, options?: any) => Promise<void>) | null = null;
+
+function sendToActiveSession(message: any, options?: any): void {
+  if (!sendActiveMessage) return;
+  try {
+    void sendActiveMessage(message, options).catch((error) => {
+      console.error("Failed to send subagent message to the active session:", error);
+    });
+  } catch (error) {
+    console.error("Failed to send subagent message to the active session:", error);
+  }
+}
 
 /** Interval timer for widget re-renders. */
 let widgetInterval: ReturnType<typeof setInterval> | null = null;
@@ -1040,7 +1049,7 @@ function handleSubagentSteer(
   };
 }
 
-function startStatusRefresh(pi: ExtensionAPI) {
+function startStatusRefresh(_pi: ExtensionAPI) {
   if (!statusConfig.enabled || statusInterval) return;
 
   statusInterval = setInterval(() => {
@@ -1078,7 +1087,7 @@ function startStatusRefresh(pi: ExtensionAPI) {
 
     if (transitionLines.length > 0) {
       const capped = capStatusLines(transitionLines, statusConfig.lineLimit);
-      pi.sendMessage(
+      sendToActiveSession(
         {
           customType: "subagent_status",
           content: formatStatusAggregate(transitionLines, statusConfig.lineLimit),
@@ -1377,7 +1386,7 @@ function deliverPendingQuestion(running: RunningSubagent): boolean {
   const elapsed = Math.floor((Date.now() - running.startTime) / 1000);
   const replyHint = `\n\nReply with subagent_message({ name: "${name}", message: "…" }) — the same name works whether it is still running or has since exited. It stays open until you reply.`;
 
-  (sendActiveMessage ?? latestPi?.sendMessage.bind(latestPi))?.(
+  sendToActiveSession(
     {
       customType: "subagent_question",
       content: `Sub-agent "${name}" asks (${formatElapsed(elapsed)}):\n\n${payload.question}${replyHint}`,
@@ -1403,7 +1412,7 @@ function deliverPendingSubagentEvents(running: RunningSubagent): void {
     const content = isProgress
       ? `Subagent "${running.name}" progress${event.percent === undefined ? "" : ` (${event.percent}%)`}: ${event.message}`
       : `Subagent "${running.name}" published artifact: ${event.path}${event.description ? ` — ${event.description}` : ""}`;
-    (sendActiveMessage ?? latestPi?.sendMessage.bind(latestPi))?.({
+    sendToActiveSession({
       customType: isProgress ? "subagent_progress" : "subagent_artifact",
       content,
       display: true,
@@ -1621,7 +1630,7 @@ async function resumePersistedSubagents(
         if (signal.aborted) return;
         updateWidget();
         const presentation = resolveResultPresentation(result, running.name);
-        pi.sendMessage({
+        sendToActiveSession({
           customType: "subagent_result",
           content: presentation,
           display: true,
@@ -1654,11 +1663,10 @@ async function resumePersistedSubagents(
 }
 
 export default function subagentsExtension(pi: ExtensionAPI) {
-  latestPi = pi;
+  sendActiveMessage = pi.sendMessage.bind(pi);
   // Capture the UI context for widget updates
   pi.on("session_start", (event, ctx) => {
     latestCtx = ctx;
-    sendActiveMessage = pi.sendMessage.bind(pi);
     // pi runs multiple sessions in one process. A prior session's shutdown
     // aborts the shared module poll-abort controller; install a fresh one so
     // subagents spawned in this session aren't watched against a dead signal.
@@ -1895,7 +1903,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
             const presentation = resolveResultPresentation(result, running.name);
 
-            pi.sendMessage(
+            sendToActiveSession(
               {
                 customType: "subagent_result",
                 content: presentation,
@@ -1917,7 +1925,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           })
           .catch((err) => {
             updateWidget();
-            pi.sendMessage(
+            sendToActiveSession(
               {
                 customType: "subagent_result",
                 content: `Sub-agent "${running.name}" error: ${err?.message ?? String(err)}`,
@@ -2094,7 +2102,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     running.abortController = abort;
     void watchSubagent(running, abort.signal).then((result) => {
       updateWidget();
-      pi.sendMessage({
+      sendToActiveSession({
         customType: "subagent_result",
         content: resolveResultPresentation(result, name),
         display: true,
@@ -2463,7 +2471,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         nativeRunning.abortController = nativeAbort;
         void watchSubagent(nativeRunning, nativeAbort.signal).then((result) => {
           updateWidget();
-          (sendActiveMessage ?? pi.sendMessage.bind(pi))({
+          sendToActiveSession({
             customType: "subagent_result",
             content: resolveResultPresentation(result, name),
             display: true,
