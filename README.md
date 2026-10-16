@@ -198,9 +198,8 @@ The complete provider list and cloud-provider setup are documented in Pi's
 ## Task profiles
 
 Pass an optional `profile` to classify the work independently from the named
-agent. Profiles add a task-specific contract and intersect their tool list with
-the agent's existing allowlist, so a profile never grants tools the agent does
-not already have:
+agent. Profiles add task-specific instructions only; they do not restrict the
+tools available to the sub-agent:
 
 ```typescript
 subagent({ agent: "scout", profile: "search", task: "Trace the session setup flow" });
@@ -208,17 +207,18 @@ subagent({ agent: "worker", profile: "refactor", task: "Extract the parser witho
 ```
 
 Available profiles: `search`, `review`, `research`, `implementation`, `refactor`,
-and `test`. `search`, `review`, and `research` are read-only. Omit `profile` to
-keep the agent's legacy behavior. The selected Pi model is inherited from the
+and `test`. `search`, `review`, and `research` ask the agent not to modify
+files, but this is an instruction rather than an enforced tool restriction.
+Omit `profile` for no task-specific instructions. The selected Pi model is inherited from the
 parent session rather than hard-coded by the bundled agent definitions.
 
 ## Bundled agents
 
-| Agent | Tools | Role |
-| ----- | ----- | ---- |
-| **scout** | `read`, `grep`, `find`, `ls` | Fast read-only codebase recon |
-| **researcher** | `web_search`, `web_fetch`, `safe_bash` | Web research, synthesized into a sourced brief |
-| **worker** | `read`, `write`, `edit`, `bash`, `web_search`, `web_fetch` + spawning | General implementer; may spawn `scout` and `researcher` |
+| Agent | Role |
+| ----- | ---- |
+| **scout** | Fast read-only codebase recon |
+| **researcher** | Web research, synthesized into a sourced brief |
+| **worker** | General implementer; may spawn `scout` and `researcher` |
 
 All three are autonomous (`auto-exit: true`) and carry their identity in the system prompt (`system-prompt: append`).
 

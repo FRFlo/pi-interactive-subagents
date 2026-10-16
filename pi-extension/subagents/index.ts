@@ -122,7 +122,6 @@ const SubagentParams = Type.Object({
 type TaskProfileName = "search" | "review" | "research" | "implementation" | "refactor" | "test";
 interface TaskProfile {
   description: string;
-  tools: string[];
   instructions: string;
   readOnly?: boolean;
 }
@@ -130,46 +129,35 @@ interface TaskProfile {
 const TASK_PROFILES: Record<TaskProfileName, TaskProfile> = {
   search: {
     description: "Read-only codebase search and architecture tracing",
-    tools: ["read", "grep", "find", "ls"],
     readOnly: true,
     instructions: "TASK PROFILE: SEARCH. Investigate without modifying files. Cite exact paths and relevant symbols/locations. Report findings and unresolved questions.",
   },
   review: {
     description: "Read-only code review and risk analysis",
-    tools: ["read", "grep", "find", "ls"],
     readOnly: true,
     instructions: "TASK PROFILE: REVIEW. Do not modify files. Prioritize concrete defects and risks; support each finding with a file/location and explain its impact. Report checks performed.",
   },
   research: {
     description: "External or technical research",
-    tools: ["web_search", "web_fetch", "read", "grep", "find", "ls"],
     readOnly: true,
     instructions: "TASK PROFILE: RESEARCH. Distinguish verified facts from assumptions and include source URLs or repository evidence. Synthesize the answer rather than listing raw search results.",
   },
   implementation: {
     description: "Implement a bounded feature or change",
-    tools: ["read", "grep", "find", "ls", "write", "edit", "bash", "safe_bash"],
     instructions: "TASK PROFILE: IMPLEMENTATION. Make the requested change within the assigned scope. Run relevant verification and report changed files, behavior, and test results.",
   },
   refactor: {
     description: "Refactor while preserving behavior",
-    tools: ["read", "grep", "find", "ls", "write", "edit", "bash", "safe_bash"],
     instructions: "TASK PROFILE: REFACTOR. Preserve externally observable behavior. Keep changes focused, inspect callers, and run relevant tests. Report any behavior change separately.",
   },
   test: {
     description: "Add or run tests",
-    tools: ["read", "grep", "find", "ls", "write", "edit", "bash", "safe_bash"],
     instructions: "TASK PROFILE: TEST. Focus on useful, deterministic coverage of the requested behavior. Run the narrowest relevant tests and report commands and outcomes.",
   },
 };
 
 function resolveTaskProfile(name: string | undefined): TaskProfile | undefined {
   return name ? TASK_PROFILES[name as TaskProfileName] : undefined;
-}
-
-function intersectToolLists(agentTools: string | undefined, profileTools: string[]): string {
-  const allowed = agentTools?.split(",").map((tool) => tool.trim()).filter(Boolean);
-  return (allowed ? profileTools.filter((tool) => allowed.includes(tool)) : profileTools).join(",");
 }
 
 type SubagentSessionMode = "standalone" | "lineage-only" | "fork";
@@ -1141,10 +1129,7 @@ async function launchNativeSubagent(
 
   const grantSpawning = !!agentDefs?.subagentAgents?.length;
   const profile = resolveTaskProfile(params.profile);
-  const effectiveTools = profile
-    ? intersectToolLists(agentDefs?.tools, profile.tools)
-    : agentDefs?.tools;
-  const toolAllowlist = buildSubagentToolAllowlist(effectiveTools, { grantSpawning });
+  const toolAllowlist = null;
   const identity = agentDefs?.body;
   const prompt = sessionMode === "fork"
     ? `${profile ? `${profile.instructions}\n\n` : ""}${params.task}`
@@ -1311,7 +1296,6 @@ export const __test__ = {
   loadAgentDefaults,
   discoverAgentDefinitions,
   resolveTaskProfile,
-  intersectToolLists,
   taskProfiles: TASK_PROFILES,
   resolveEffectiveSessionMode,
   resolveLaunchBehavior,

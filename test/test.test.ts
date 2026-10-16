@@ -1224,14 +1224,11 @@ describe("status.ts", () => {
 });
 
 describe("subagent discovery", () => {
-  it("defines task profiles and intersects their tools with agent permissions", () => {
+  it("defines task profiles without restricting available tools", () => {
     const search = testApi.resolveTaskProfile("search");
     assert.ok(search);
     assert.equal(search.readOnly, true);
-    assert.deepEqual(
-      testApi.intersectToolLists("read,write,edit,bash", search.tools).split(","),
-      ["read"],
-    );
+    assert.equal("tools" in search, false);
     assert.equal(testApi.resolveTaskProfile("unknown"), undefined);
     assert.deepEqual(Object.keys(testApi.taskProfiles).sort(), [
       "implementation", "refactor", "research", "review", "search", "test",
@@ -1364,18 +1361,12 @@ describe("subagent discovery", () => {
     }
   });
 
-  it("worker is granted the spawning toolset restricted to scout and researcher", () => {
+  it("worker declares its allowed subagent targets without a tool allowlist", () => {
     const worker = testApi.loadAgentDefaults("worker");
     assert.ok(worker, "expected bundled worker to be discoverable");
     assert.deepEqual(worker.subagentAgents, ["scout", "researcher"]);
-
-    const allowlist = testApi.buildSubagentToolAllowlist(worker.tools, { grantSpawning: true });
-    assert.ok(allowlist, "expected an allowlist");
-    const tools = new Set(allowlist!.split(","));
-    for (const t of ["subagent", "subagent_message", "subagents_list"]) {
-      assert.ok(tools.has(t), `expected spawning tool ${t} in worker allowlist`);
-    }
-    assert.ok(tools.has("bash"), "expected worker to keep bash");
+    assert.equal(worker.tools, undefined);
+    assert.equal(testApi.buildSubagentToolAllowlist(worker.tools, { grantSpawning: false }), null);
   });
 
   it("scout and researcher are not granted spawning tools", () => {
@@ -1957,7 +1948,7 @@ describe("tool registration", () => {
     assert.match(result.content[0].text, /not a known agent/i);
   });
 
-  it("exposes agent/task plus optional profile, name/model/cwd, no override knobs", () => {
+  it("exposes agent/task plus optional profile, name/model/cwd without tool overrides", () => {
     const { api, registeredTools } = createMockExtensionApi();
     (subagentsModule as any).default(api);
 
