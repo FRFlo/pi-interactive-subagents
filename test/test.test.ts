@@ -1912,6 +1912,15 @@ describe("commands", () => {
 });
 
 describe("tool registration", () => {
+  it("recovers persisted subagents on startup and explicit resume", () => {
+    const shouldRecover = (subagentsModule as any).__test__.shouldRecoverPersistedSubagents;
+    assert.equal(shouldRecover("startup"), true);
+    assert.equal(shouldRecover("resume"), true);
+    assert.equal(shouldRecover("new"), false);
+    assert.equal(shouldRecover("reload"), false);
+    assert.equal(shouldRecover("fork"), false);
+  });
+
   it("always resumes subagents as autonomous (auto-exit, non-interactive tracking)", () => {
     const testApi = (subagentsModule as any).__test__;
 

@@ -1314,6 +1314,7 @@ export const __test__ = {
   resolveResultPresentation,
   resolveResumeLaunchBehavior,
   pendingQuestionForRecovery,
+  shouldRecoverPersistedSubagents,
   runningSubagents,
   formatElapsed,
   formatTokens,
@@ -1322,6 +1323,12 @@ export const __test__ = {
   formatUsageSegments,
   widgetIcon,
 };
+
+function shouldRecoverPersistedSubagents(reason: string): boolean {
+  // "startup" is used when Pi opens the default session at process launch;
+  // "resume" is used when explicitly opening a saved session.
+  return reason === "startup" || reason === "resume";
+}
 
 function startWidgetRefresh() {
   if (widgetInterval) return;
@@ -1664,7 +1671,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       startWidgetRefresh();
       startStatusRefresh(pi);
     }
-    if (event.reason === "resume") {
+    if (shouldRecoverPersistedSubagents(event.reason)) {
       void resumePersistedSubagents(ctx, pi).catch((error) => {
         ctx.ui.notify(`Could not restore subagents: ${error instanceof Error ? error.message : String(error)}`, "error");
       });
