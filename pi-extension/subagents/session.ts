@@ -210,6 +210,12 @@ export interface NameRegistryEntry {
   sessionFile: string;
   /** Canonical session header id (kept for display/lineage). */
   sessionId: string | null;
+  /** Activity snapshot used to recover this subagent after the parent resumes. */
+  activityFile?: string;
+  /** Id embedded in the corresponding activity snapshot. */
+  runningChildId?: string;
+  task?: string;
+  agent?: string;
 }
 
 export type NameRegistry = Record<string, NameRegistryEntry>;
@@ -513,6 +519,36 @@ export function getNewEntries(sessionFile: string, afterLine: number): SessionEn
   const raw = readFileSync(sessionFile, "utf8");
   const lines = raw.split("\n").filter((line) => line.trim());
   return lines.slice(afterLine).map((line) => JSON.parse(line) as SessionEntry);
+}
+
+export interface LatestToolCall {
+  id?: string;
+  name: string;
+  arguments?: unknown;
+}
+
+/** Return the newest assistant tool call in transcript order, if any. */
+export function getLatestToolCall(sessionFile: string): LatestToolCall | null {
+  try {
+    const entries = readEntries(sessionFile);
+    for (let i = entries.length - 1; i >= 0; i--) {
+      const entry = entries[i] as any;
+      if (entry.type !== "message" || entry.message?.role !== "assistant") continue;
+      const content = Array.isArray(entry.message.content) ? entry.message.content : [];
+      for (let j = content.length - 1; j >= 0; j--) {
+        const block = content[j];
+        if (block?.type !== "toolCall" || typeof block.name !== "string") continue;
+        return {
+          ...(typeof block.id === "string" ? { id: block.id } : {}),
+          name: block.name,
+          ...(block.arguments !== undefined ? { arguments: block.arguments } : {}),
+        };
+      }
+    }
+  } catch {
+    // A missing or partially written transcript has no safely resolvable call.
+  }
+  return null;
 }
 
 /**

@@ -13,13 +13,18 @@ import {
   unlinkSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { createNativeSubagent, type NativeSubagent } from "./native-session.ts";
+import {
+  createNativeSubagent,
+  getNativeSubagentSessionDir,
+  type NativeSubagent,
+} from "./native-session.ts";
 import { createSubagentDoneExtension } from "./subagent-done.ts";
 
 import {
   countSessionEntryLines,
   findLastAssistantMessage,
   forkSubagentSessionFile,
+  getLatestToolCall,
   getNewEntries,
   getSessionId,
   readNameRegistry,
@@ -660,10 +665,12 @@ interface RunningSubagent {
    * subagent (e.g. planner).
    */
   interactive: boolean;
+  pendingQuestion?: boolean;
 }
 
 /** All currently running subagents, keyed by id. */
 const runningSubagents = new Map<string, RunningSubagent>();
+const autoResumedParentSessions = new Set<string>();
 let focusedSubagentId: string | null = null;
 let focusedParentSessionFile: string | null = null;
 let switchFocusedSession: ((
@@ -1118,7 +1125,10 @@ async function launchNativeSubagent(
   const parentSessionFile = ctx.sessionManager.getSessionFile();
   if (!parentSessionFile) throw new Error("No session file");
   const sessionMode = resolveEffectiveSessionMode(params, agentDefs);
-  const targetSession = SessionManager.create(effectiveCwd).getSessionFile();
+  const targetSession = SessionManager.create(
+    effectiveCwd,
+    getNativeSubagentSessionDir(getAgentConfigDir()),
+  ).getSessionFile();
   if (!targetSession) throw new Error("Unable to create subagent session");
   if (sessionMode === "lineage-only" || sessionMode === "fork") {
     seedSubagentSessionFile({
@@ -1195,12 +1205,33 @@ async function launchNativeSubagent(
   return running;
 }
 
+function waitForNextAgentEnd(
+  session: NativeSubagent["session"],
+  signal: AbortSignal,
+): Promise<void> {
+  return new Promise((resolvePromise) => {
+    let started = false;
+    let unsubscribe = () => {};
+    const cleanup = () => {
+      unsubscribe();
+      signal.removeEventListener("abort", cleanup);
+      resolvePromise();
+    };
+    unsubscribe = session.subscribe((event: any) => {
+      if (event.type === "agent_start") started = true;
+      if (started && event.type === "agent_end") cleanup();
+    });
+    signal.addEventListener("abort", cleanup, { once: true });
+  });
+}
+
 async function resumeNativeSubagent(
   name: string,
-  message: string,
+  message: string | null,
   sessionPath: string,
   loadout: SubagentLoadout,
   ctx: { sessionManager: { getSessionDir(): string; getSessionId(): string }; cwd: string; model?: any },
+  pendingQuestion?: { question: string; toolCallId?: string },
 ): Promise<RunningSubagent> {
   const startTime = Date.now();
   const id = Math.random().toString(16).slice(2, 10);
@@ -1221,6 +1252,7 @@ async function resumeNativeSubagent(
       sessionFile,
       id,
       activityFile,
+      initialPendingQuestion: pendingQuestion,
       autoExit: true,
       cwd: loadout.cwd ?? ctx.cwd,
     })(pi),
@@ -1228,18 +1260,27 @@ async function resumeNativeSubagent(
   const running: RunningSubagent = {
     id,
     name,
-    task: message,
+    task: message ?? "Restored while waiting for parent input.",
+    agent: loadout.agent ?? undefined,
     native,
     startTime,
     sessionFile: sessionPath,
     activityFile,
     interactive: false,
     statusState: createStatusState({ source: "pi", startTimeMs: startTime }),
+    eventCount: readSubagentEvents(sessionPath).length,
+    pendingQuestion: !!pendingQuestion,
   };
   runningSubagents.set(id, running);
-  running.nativeRun = native.session.prompt(message).catch((error) => {
-    (running as any).nativeError = error instanceof Error ? error.message : String(error);
-  });
+  const abortController = new AbortController();
+  running.abortController = abortController;
+  if (message === null) {
+    running.nativeRun = waitForNextAgentEnd(native.session, abortController.signal);
+  } else {
+    running.nativeRun = native.session.prompt(message).catch((error) => {
+      (running as any).nativeError = error instanceof Error ? error.message : String(error);
+    });
+  }
   return running;
 }
 
@@ -1252,7 +1293,10 @@ async function cloneNativeSubagent(
   ctx: { sessionManager: { getSessionDir(): string; getSessionId(): string }; cwd: string; model?: any },
 ): Promise<RunningSubagent> {
   const cwd = loadout.cwd ?? ctx.cwd;
-  const targetSession = SessionManager.create(cwd).getSessionFile();
+  const targetSession = SessionManager.create(
+    cwd,
+    getNativeSubagentSessionDir(getAgentConfigDir()),
+  ).getSessionFile();
   if (!targetSession) throw new Error("Unable to create cloned subagent session");
   if (mode === "fork") {
     forkSubagentSessionFile({ sourceSessionFile: sourceSession, childSessionFile: targetSession, childCwd: cwd });
@@ -1283,6 +1327,7 @@ export const __test__ = {
   handleSubagentSteer,
   resolveResultPresentation,
   resolveResumeLaunchBehavior,
+  pendingQuestionForRecovery,
   runningSubagents,
   formatElapsed,
   formatTokens,
@@ -1308,11 +1353,11 @@ function startWidgetRefresh() {
  * multiple subagents are delivered independently. The file is deleted after
  * delivery so it fires once per question (a subagent may ask again later).
  */
-function deliverPendingQuestion(running: RunningSubagent): void {
+function deliverPendingQuestion(running: RunningSubagent): boolean {
   const askFile = `${running.sessionFile}.ask`;
   let payload: any = null;
   try {
-    if (!existsSync(askFile)) return;
+    if (!existsSync(askFile)) return false;
     payload = JSON.parse(readFileSync(askFile, "utf-8"));
   } catch {
     // Malformed/partway-written file — drop it and move on.
@@ -1320,7 +1365,19 @@ function deliverPendingQuestion(running: RunningSubagent): void {
   try {
     unlinkSync(askFile);
   } catch {}
-  if (!payload?.question) return;
+  if (!payload?.question) return false;
+
+  const latestToolCall = getLatestToolCall(running.sessionFile);
+  if (
+    latestToolCall?.name !== "ask_question" ||
+    (payload.toolCallId && payload.toolCallId !== latestToolCall.id)
+  ) {
+    return false;
+  }
+  if (running.activityFile) {
+    const activity = readSubagentActivityFile(running.activityFile, running.id);
+    if (activity.ok && activity.activity.pendingQuestion === false) return false;
+  }
 
   const name = running.name; // unique per session (deduped at spawn) — targets the reply
   const sessionId = existsSync(running.sessionFile) ? getSessionId(running.sessionFile) : null;
@@ -1341,6 +1398,7 @@ function deliverPendingQuestion(running: RunningSubagent): void {
     },
     { triggerTurn: true, deliverAs: "steer" },
   );
+  return true;
 }
 
 function deliverPendingSubagentEvents(running: RunningSubagent): void {
@@ -1375,11 +1433,11 @@ async function watchSubagent(
           deliverPendingSubagentEvents(running);
         }
       });
+      if (running.pendingQuestion) deliverPendingQuestion(running);
       await running.nativeRun;
       unsubscribeEvents();
       deliverPendingSubagentEvents(running);
-      const hasQuestion = existsSync(`${sessionFile}.ask`);
-      deliverPendingQuestion(running);
+      const hasQuestion = deliverPendingQuestion(running);
       if (hasQuestion) {
         await new Promise<void>((resolve) => {
           const unsubscribe = running.native!.session.subscribe((event) => {
@@ -1464,10 +1522,147 @@ async function watchSubagent(
   }
 }
 
+function pendingQuestionForRecovery(
+  sessionFile: string,
+  activity: SubagentActivityState,
+): { question: string; toolCallId?: string } | undefined {
+  const askFile = `${sessionFile}.ask`;
+  let savedAsk: any;
+  try {
+    if (existsSync(askFile)) savedAsk = JSON.parse(readFileSync(askFile, "utf8"));
+  } catch {
+    savedAsk = undefined;
+  }
+
+  const hasSignal = !!savedAsk && typeof savedAsk.question === "string";
+  const explicitlyPending = activity.pendingQuestion === true;
+  if (!explicitlyPending && (activity.pendingQuestion === false || !hasSignal)) {
+    if (hasSignal) {
+      try { unlinkSync(askFile); } catch {}
+    }
+    return undefined;
+  }
+
+  const latestToolCall = getLatestToolCall(sessionFile);
+  if (
+    latestToolCall?.name !== "ask_question" ||
+    (savedAsk?.toolCallId && savedAsk.toolCallId !== latestToolCall.id)
+  ) {
+    if (hasSignal) {
+      try { unlinkSync(askFile); } catch {}
+    }
+    return undefined;
+  }
+
+  let args = latestToolCall.arguments as any;
+  if (typeof args === "string") {
+    try {
+      args = JSON.parse(args);
+    } catch {
+      args = undefined;
+    }
+  }
+  const question =
+    (typeof savedAsk?.question === "string" && savedAsk.question.trim()) ||
+    (typeof args?.question === "string" && args.question.trim());
+  if (!question) return undefined;
+  return {
+    question,
+    ...(latestToolCall.id ? { toolCallId: latestToolCall.id } : {}),
+  };
+}
+
+async function resumePersistedSubagents(
+  ctx: ExtensionContext,
+  pi: ExtensionAPI,
+): Promise<void> {
+  const parentSessionFile = ctx.sessionManager.getSessionFile();
+  if (!parentSessionFile || autoResumedParentSessions.has(parentSessionFile)) return;
+  autoResumedParentSessions.add(parentSessionFile);
+
+  const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), ctx.sessionManager.getSessionId());
+  const registry = readNameRegistry(artifactDir);
+  let restored = 0;
+
+  for (const [name, entry] of Object.entries(registry)) {
+    const sessionFile = entry.sessionFile;
+    if (!existsSync(sessionFile) || !entry.activityFile || !entry.runningChildId) continue;
+    if (Array.from(runningSubagents.values()).some((running) => running.sessionFile === sessionFile)) continue;
+
+    const activityRead = readSubagentActivityFile(entry.activityFile, entry.runningChildId);
+    if (!activityRead.ok || activityRead.activity.phase === "done") continue;
+    const loadout = readSubagentLoadout(sessionFile);
+    if (!loadout) continue;
+
+    const pendingQuestion = pendingQuestionForRecovery(sessionFile, activityRead.activity);
+    const continuation = pendingQuestion
+      ? null
+      : "Pi restarted while this subagent was unfinished. Continue from the saved transcript and current state; do not repeat completed work.";
+
+    try {
+      const running = await resumeNativeSubagent(
+        name,
+        continuation,
+        sessionFile,
+        loadout,
+        ctx,
+        pendingQuestion,
+      );
+      running.task = entry.task ?? running.task;
+      running.agent = entry.agent ?? loadout.agent ?? undefined;
+      running.pendingQuestion = !!pendingQuestion;
+      registerName(artifactDir, name, {
+        sessionFile,
+        sessionId: getSessionId(sessionFile),
+        activityFile: running.activityFile,
+        runningChildId: running.id,
+        task: running.task,
+        agent: running.agent,
+      });
+
+      const signal = running.abortController?.signal ?? new AbortController().signal;
+      startWidgetRefresh();
+      startStatusRefresh(pi);
+      void watchSubagent(running, signal).then((result) => {
+        if (signal.aborted) return;
+        updateWidget();
+        const presentation = resolveResultPresentation(result, running.name);
+        pi.sendMessage({
+          customType: "subagent_result",
+          content: presentation,
+          display: true,
+          details: {
+            name: running.name,
+            task: running.task,
+            agent: running.agent,
+            exitCode: result.exitCode,
+            elapsed: result.elapsed,
+            sessionFile: result.sessionFile,
+            sessionId: result.sessionId,
+            stats: result.stats,
+            error: result.error,
+          },
+        }, { triggerTurn: true });
+      }).catch((error) => {
+        if (!signal.aborted) {
+          ctx.ui.notify(`Could not watch resumed subagent ${name}: ${error instanceof Error ? error.message : String(error)}`, "error");
+        }
+      });
+      restored++;
+    } catch (error) {
+      ctx.ui.notify(`Could not resume subagent ${name}: ${error instanceof Error ? error.message : String(error)}`, "error");
+    }
+  }
+
+  if (restored > 0) {
+    ctx.ui.notify(`Resumed ${restored} unfinished subagent${restored === 1 ? "" : "s"}.`, "info");
+  }
+}
+
 export default function subagentsExtension(pi: ExtensionAPI) {
   latestPi = pi;
   // Capture the UI context for widget updates
-  pi.on("session_start", (_event, ctx) => {
+  pi.on("session_start", (event, ctx) => {
     latestCtx = ctx;
     // pi runs multiple sessions in one process. A prior session's shutdown
     // aborts the shared module poll-abort controller; install a fresh one so
@@ -1480,6 +1675,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     if (runningSubagents.size > 0) {
       startWidgetRefresh();
       startStatusRefresh(pi);
+    }
+    if (event.reason === "resume") {
+      void resumePersistedSubagents(ctx, pi).catch((error) => {
+        ctx.ui.notify(`Could not restore subagents: ${error instanceof Error ? error.message : String(error)}`, "error");
+      });
     }
   });
 
@@ -1678,6 +1878,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         registerName(parentArtifactDir, running.name, {
           sessionFile: running.sessionFile,
           sessionId: getSessionId(running.sessionFile),
+          activityFile: running.activityFile,
+          runningChildId: running.id,
+          task: running.task,
+          agent: running.agent,
         });
 
         // Create a separate AbortController for the watcher
@@ -1978,7 +2182,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       const loadout = readSubagentLoadout(entry.sessionFile);
       if (!loadout) return { content: [{ type: "text", text: `No sandbox loadout found for "${sourceName}".` }], details: { error: "no loadout" } };
       const cloned = await cloneNativeSubagent(targetName, params.task, entry.sessionFile, loadout, mode, ctx);
-      registerName(artifactDir, targetName, { sessionFile: cloned.sessionFile, sessionId: getSessionId(cloned.sessionFile) });
+      registerName(artifactDir, targetName, {
+        sessionFile: cloned.sessionFile,
+        sessionId: getSessionId(cloned.sessionFile),
+        activityFile: cloned.activityFile,
+        runningChildId: cloned.id,
+        task: cloned.task,
+        agent: cloned.agent,
+      });
       superviseClone(cloned, targetName, params.task);
       return { content: [{ type: "text", text: `Subagent "${targetName}" ${mode === "fork" ? "forked" : "restarted"}.` }], details: { name: targetName, status: "started", sessionFile: cloned.sessionFile } };
     },
@@ -2243,6 +2454,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         }
 
         const nativeRunning = await resumeNativeSubagent(requestedName, message, sessionPath, loadout, ctx);
+        registerName(getArtifactDir(ctx.sessionManager.getSessionDir(), ctx.sessionManager.getSessionId()), requestedName, {
+          sessionFile: sessionPath,
+          sessionId: getSessionId(sessionPath),
+          activityFile: nativeRunning.activityFile,
+          runningChildId: nativeRunning.id,
+          task: message,
+          agent: loadout.agent ?? undefined,
+        });
         startWidgetRefresh();
         startStatusRefresh(pi);
         const nativeAbort = new AbortController();

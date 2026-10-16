@@ -35,6 +35,7 @@ export interface SubagentActivityState {
   turnActive: boolean;
   providerActive: boolean;
   toolActive: boolean;
+  pendingQuestion?: boolean;
   activeScope?: SubagentActivityScope;
   activeSince?: number;
   waitingSince?: number;
@@ -168,6 +169,9 @@ function validateActivity(value: unknown, expectedRunningChildId: string): Activ
     validateBoolean(object, "turnActive"),
     validateBoolean(object, "providerActive"),
     validateBoolean(object, "toolActive"),
+    object.pendingQuestion == null || typeof object.pendingQuestion === "boolean"
+      ? null
+      : "pendingQuestion must be a boolean",
     validateOptionalFiniteNumber(object, "activeSince"),
     validateOptionalFiniteNumber(object, "waitingSince"),
     validateOptionalInteger(object, "turnIndex"),
@@ -310,6 +314,7 @@ export function createSubagentActivityRecorder(params: {
     turnActive: false,
     providerActive: false,
     toolActive: false,
+    pendingQuestion: false,
   };
 
   let disabled = false;
@@ -376,6 +381,7 @@ export function createSubagentActivityRecorder(params: {
   function markDone(latestEvent: SubagentActivityEvent): void {
     record(latestEvent, (current) => {
       current.phase = "done";
+      current.pendingQuestion = false;
       clearActiveState(current);
       delete current.waitingSince;
     }, "immediate");
@@ -391,7 +397,9 @@ export function createSubagentActivityRecorder(params: {
       }, "immediate");
     },
     input() {
-      record("input", () => {}, "immediate");
+      record("input", (current) => {
+        current.pendingQuestion = false;
+      }, "immediate");
     },
     beforeAgentStart() {
       record("before_agent_start", (current, observedAt) => {
@@ -401,6 +409,7 @@ export function createSubagentActivityRecorder(params: {
     },
     agentStart() {
       record("agent_start", (current, observedAt) => {
+        current.pendingQuestion = false;
         current.agentActive = true;
         markActive(current, "agent", observedAt);
       }, "immediate");
@@ -498,6 +507,7 @@ export function createSubagentActivityRecorder(params: {
       // "waiting" phase (do NOT disable the recorder) so the status widget shows
       // it as waiting and recording resumes when the answer arrives.
       record("ask_question", (current, observedAt) => {
+        current.pendingQuestion = true;
         clearActiveState(current);
         current.phase = "waiting";
         current.waitingSince = observedAt;

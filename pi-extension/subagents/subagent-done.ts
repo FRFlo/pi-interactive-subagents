@@ -118,6 +118,7 @@ export interface SubagentDoneConfig {
   sessionFile?: string;
   id?: string;
   activityFile?: string;
+  initialPendingQuestion?: { question: string; toolCallId?: string };
   autoExit?: boolean;
   cwd?: string;
 }
@@ -200,6 +201,17 @@ export function createSubagentDoneExtension(config: SubagentDoneConfig = {}) {
   // Show widget + status bar on session start
   pi.on("session_start", (_event, ctx) => {
     recorder.sessionStart();
+    if (config.initialPendingQuestion) {
+      awaitingAnswer = true;
+      recorder.askQuestion();
+      if (config.sessionFile) {
+        writeFileSync(`${config.sessionFile}.ask`, JSON.stringify({
+          name: subagentName || "subagent",
+          agent: subagentAgent || undefined,
+          ...config.initialPendingQuestion,
+        }));
+      }
+    }
     const tools = pi.getAllTools();
     toolNames = tools.map((t) => t.name).sort();
     denied = parseDeniedTools(deniedToolsValue);
@@ -367,7 +379,7 @@ export function createSubagentDoneExtension(config: SubagentDoneConfig = {}) {
           "The single freeform question to ask the orchestrator. Include enough context to answer it directly.",
       }),
     }),
-    async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+    async execute(toolCallId, params, _signal, _onUpdate, _ctx) {
       const sessionFile = process.env.PI_SUBAGENT_SESSION;
       if (!sessionFile) {
         throw new Error(
@@ -385,6 +397,7 @@ export function createSubagentDoneExtension(config: SubagentDoneConfig = {}) {
         name: subagentName || "subagent",
         agent: subagentAgent,
         question: params.question,
+        toolCallId,
       };
       writeFileSync(`${sessionFile}.ask`, JSON.stringify(askData));
 

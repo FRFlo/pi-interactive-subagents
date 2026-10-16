@@ -7,6 +7,16 @@ import {
   type ExtensionFactory,
 } from "@mariozechner/pi-coding-agent";
 import * as PiCodingAgent from "@mariozechner/pi-coding-agent";
+import { join } from "node:path";
+
+/**
+ * Keep durable subagent transcripts outside Pi's default `sessions/` tree.
+ * They remain addressable by their registered file paths, but are not offered
+ * by `/resume` or `pi --resume`.
+ */
+export function getNativeSubagentSessionDir(agentDir: string): string {
+  return join(agentDir, "subagent-sessions");
+}
 
 export interface NativeSubagentOptions {
   cwd: string;
@@ -35,9 +45,11 @@ export interface NativeSubagent {
 export async function createNativeSubagent(options: NativeSubagentOptions): Promise<NativeSubagent> {
   const sessionManager = options.sessionFile
     ? SessionManager.open(options.sessionFile, undefined, options.cwd)
-    : SessionManager.create(options.cwd, undefined, options.parentSessionFile
-      ? { parentSession: options.parentSessionFile }
-      : undefined);
+    : SessionManager.create(
+      options.cwd,
+      getNativeSubagentSessionDir(options.agentDir),
+      options.parentSessionFile ? { parentSession: options.parentSessionFile } : undefined,
+    );
   const settingsManager = SettingsManager.create(options.cwd, options.agentDir);
   const extensionFactories = [
     ...(options.extensionFactories ?? []),

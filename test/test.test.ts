@@ -5,13 +5,16 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { visibleWidth } from "@mariozechner/pi-tui";
+import { SessionManager } from "@mariozechner/pi-coding-agent";
 import * as subagentsModule from "../pi-extension/subagents/index.ts";
+import { getNativeSubagentSessionDir } from "../pi-extension/subagents/native-session.ts";
 
 import {
   getLeafId,
   getNewEntries,
   countSessionEntryLines,
   getSessionId,
+  getLatestToolCall,
   readNameRegistry,
   readSubagentLoadout,
   registerName,
@@ -273,6 +276,124 @@ describe("session.ts", () => {
       assert.equal(countSessionEntryLines(file), 1);
       assert.equal(countSessionEntryLines(join(dir, "does-not-exist.jsonl")), 0);
     });
+  });
+
+  describe("getLatestToolCall", () => {
+    it("returns the newest tool call, not an older ask_question", () => {
+      const file = createSessionFile(dir, [
+        SESSION_HEADER,
+        {
+          type: "message",
+          id: "ask-msg",
+          message: {
+            role: "assistant",
+            content: [{ type: "toolCall", id: "ask-1", name: "ask_question", arguments: { question: "old?" } }],
+          },
+        },
+        {
+          type: "message",
+          id: "read-msg",
+          message: {
+            role: "assistant",
+            content: [{ type: "toolCall", id: "read-1", name: "read", arguments: { path: "README.md" } }],
+          },
+        },
+      ]);
+
+      assert.deepEqual(getLatestToolCall(file), {
+        id: "read-1",
+        name: "read",
+        arguments: { path: "README.md" },
+      });
+    });
+
+    it("returns the latest ask_question when it really is the last tool call", () => {
+      const file = createSessionFile(dir, [
+        SESSION_HEADER,
+        {
+          type: "message",
+          id: "ask-msg",
+          message: {
+            role: "assistant",
+            content: [{ type: "toolCall", id: "ask-2", name: "ask_question", arguments: { question: "now?" } }],
+          },
+        },
+      ]);
+
+      assert.equal(getLatestToolCall(file)?.name, "ask_question");
+      assert.equal(getLatestToolCall(file)?.id, "ask-2");
+    });
+  });
+
+  it("does not restore a stale ask_question when a newer tool call exists", () => {
+    const file = createSessionFile(dir, [
+      SESSION_HEADER,
+      {
+        type: "message",
+        id: "old-ask",
+        message: {
+          role: "assistant",
+          content: [{ type: "toolCall", id: "ask-old", name: "ask_question", arguments: { question: "old?" } }],
+        },
+      },
+      {
+        type: "message",
+        id: "new-tool",
+        message: {
+          role: "assistant",
+          content: [{ type: "toolCall", id: "read-new", name: "read", arguments: { path: "src/index.ts" } }],
+        },
+      },
+    ]);
+    writeFileSync(`${file}.ask`, JSON.stringify({ question: "old?", toolCallId: "ask-old" }));
+
+    const restored = (subagentsModule as any).__test__.pendingQuestionForRecovery(file, {
+      version: 1,
+      runningChildId: "child",
+      createdAt: 1,
+      updatedAt: 1,
+      sequence: 1,
+      latestEvent: "ask_question",
+      phase: "waiting",
+      agentActive: false,
+      turnActive: false,
+      providerActive: false,
+      toolActive: false,
+      pendingQuestion: true,
+    });
+
+    assert.equal(restored, undefined);
+    assert.equal(existsSync(`${file}.ask`), false);
+  });
+
+  it("rebuilds the pending question from the newest ask tool call", () => {
+    const file = createSessionFile(dir, [
+      SESSION_HEADER,
+      {
+        type: "message",
+        id: "current-ask",
+        message: {
+          role: "assistant",
+          content: [{ type: "toolCall", id: "ask-current", name: "ask_question", arguments: { question: "Continue?" } }],
+        },
+      },
+    ]);
+    const restored = (subagentsModule as any).__test__.pendingQuestionForRecovery(file, {
+      version: 1,
+      runningChildId: "child",
+      createdAt: 1,
+      updatedAt: 1,
+      sequence: 1,
+      latestEvent: "ask_question",
+      phase: "waiting",
+      agentActive: false,
+      turnActive: false,
+      providerActive: false,
+      toolActive: false,
+      pendingQuestion: true,
+    });
+
+    assert.deepEqual(restored, { question: "Continue?", toolCallId: "ask-current" });
   });
 
   describe("subagent events and full transcript forks", () => {
@@ -701,6 +822,26 @@ describe("session.ts", () => {
     it("returns null for an unreadable file", () => {
       assert.equal(summarizeSessionStats(join(dir, "does-not-exist.jsonl")), null);
     });
+  });
+});
+
+describe("native subagent session storage", () => {
+  it("uses a dedicated persistent directory outside Pi's default resume index", () => {
+    const dir = createTestDir();
+    try {
+      const agentDir = join(dir, "agent-config");
+      const sessionDir = getNativeSubagentSessionDir(agentDir);
+      const manager = SessionManager.create(dir, sessionDir);
+
+      const sessionFile = manager.getSessionFile();
+      assert.ok(sessionFile);
+      assert.equal(manager.isPersisted(), true);
+      assert.equal(manager.getSessionDir(), sessionDir);
+      assert.ok(sessionFile.startsWith(sessionDir));
+      assert.notEqual(sessionDir, join(agentDir, "sessions"));
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 
@@ -1616,6 +1757,46 @@ describe("subagent-done.ts", () => {
       }
     });
 
+    it("rehydrates a pending ask when a child session is reopened", () => {
+      const dir = createTestDir();
+      const sessionFile = join(dir, "child.jsonl");
+      const activityFile = getSubagentActivityFile(dir, "child-restore");
+      mkdirSync(join(dir, "subagent-activity"), { recursive: true });
+      const handlers = new Map<string, Function>();
+      const mock = createMockExtensionApi();
+      const api = {
+        ...mock.api,
+        on(event: string, handler: Function) {
+          handlers.set(event, handler);
+        },
+      } as any;
+
+      try {
+        createSubagentDoneExtension({
+          name: "scout-2",
+          agent: "scout",
+          sessionFile,
+          id: "child-restore",
+          activityFile,
+          initialPendingQuestion: { question: "Which option?", toolCallId: "ask-restore" },
+        })(api);
+
+        handlers.get("session_start")?.(
+          { type: "session_start", reason: "resume" },
+          { ui: { setWidget() {} }, shutdown() {} },
+        );
+
+        const ask = JSON.parse(readFileSync(`${sessionFile}.ask`, "utf8"));
+        assert.equal(ask.question, "Which option?");
+        assert.equal(ask.toolCallId, "ask-restore");
+        const activity = readSubagentActivityFile(activityFile, "child-restore");
+        assert.ok(activity.ok);
+        assert.equal(activity.activity.pendingQuestion, true);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
     // Regression tests for the mid-run reply race: a reply steered in while the
     // asking run is still open fires `input` but NOT `agent_start`, so the flag
     // must be cleared on `input` or the session parks forever.
@@ -1870,6 +2051,7 @@ describe("subagent activity snapshots", () => {
       turnActive: false,
       providerActive: false,
       toolActive: false,
+      pendingQuestion: false,
       ...overrides,
     };
   }
@@ -1926,6 +2108,28 @@ describe("subagent activity snapshots", () => {
     });
   });
 
+  it("persists whether an ask_question is still awaiting a reply", () => {
+    withTempDir((dir) => {
+      const activityFile = getSubagentActivityFile(dir, "child-question");
+      const recorder = createSubagentActivityRecorder({
+        runningChildId: "child-question",
+        activityFile,
+        now: () => 5_000,
+      });
+
+      recorder.sessionStart();
+      recorder.askQuestion();
+      let read = readSubagentActivityFile(activityFile, "child-question");
+      assert.ok(read.ok);
+      assert.equal(read.activity.pendingQuestion, true);
+
+      recorder.input();
+      read = readSubagentActivityFile(activityFile, "child-question");
+      assert.ok(read.ok);
+      assert.equal(read.activity.pendingQuestion, false);
+    });
+  });
+
   it("rejects malformed activity fields used by classification and rendering", () => {
     withTempDir((dir) => {
       mkdirSync(join(dir, "subagent-activity"), { recursive: true });
@@ -1936,6 +2140,7 @@ describe("subagent activity snapshots", () => {
         { latestEvent: "unknown" },
         { runningChildId: 42 },
         { toolActive: "yes" },
+        { pendingQuestion: "yes" },
         { toolName: "bad\nname" },
       ];
 
