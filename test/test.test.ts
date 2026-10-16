@@ -1912,6 +1912,15 @@ describe("commands", () => {
 });
 
 describe("tool registration", () => {
+  it("does not send through a session context after shutdown invalidates it", () => {
+    const testApi = (subagentsModule as any).__test__;
+    let sent = 0;
+    testApi.bindActiveSessionSender(async () => { sent++; });
+    testApi.clearActiveSessionSender();
+    testApi.sendToActiveSession({ customType: "subagent_result", content: "late" });
+    assert.equal(sent, 0);
+  });
+
   it("recovers persisted subagents on startup and explicit resume", () => {
     const shouldRecover = (subagentsModule as any).__test__.shouldRecoverPersistedSubagents;
     assert.equal(shouldRecover("startup"), true);
@@ -1919,6 +1928,16 @@ describe("tool registration", () => {
     assert.equal(shouldRecover("new"), false);
     assert.equal(shouldRecover("reload"), false);
     assert.equal(shouldRecover("fork"), false);
+  });
+
+  it("only recovers unfinished activity or a pending question", () => {
+    const shouldRecover = (subagentsModule as any).__test__.shouldRecoverSubagent;
+    assert.equal(shouldRecover({ phase: "starting" }), true);
+    assert.equal(shouldRecover({ phase: "active" }), true);
+    assert.equal(shouldRecover({ phase: "waiting", pendingQuestion: true }), true);
+    assert.equal(shouldRecover({ phase: "waiting", pendingQuestion: false }), false);
+    assert.equal(shouldRecover({ phase: "waiting" }), false);
+    assert.equal(shouldRecover({ phase: "done" }), false);
   });
 
   it("always resumes subagents as autonomous (auto-exit, non-interactive tracking)", () => {

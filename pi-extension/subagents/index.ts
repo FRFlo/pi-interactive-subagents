@@ -682,6 +682,14 @@ let latestCtx: ExtensionContext | null = null;
 /** Send method rebound from withSession after session replacement. */
 let sendActiveMessage: ((message: any, options?: any) => Promise<void>) | null = null;
 
+function bindActiveSessionSender(sendMessage: (message: any, options?: any) => Promise<void>): void {
+  sendActiveMessage = sendMessage;
+}
+
+function clearActiveSessionSender(): void {
+  sendActiveMessage = null;
+}
+
 function sendToActiveSession(message: any, options?: any): void {
   if (!sendActiveMessage) return;
   try {
@@ -1323,7 +1331,11 @@ export const __test__ = {
   resolveResultPresentation,
   resolveResumeLaunchBehavior,
   pendingQuestionForRecovery,
+  shouldRecoverSubagent,
   shouldRecoverPersistedSubagents,
+  bindActiveSessionSender,
+  clearActiveSessionSender,
+  sendToActiveSession,
   runningSubagents,
   formatElapsed,
   formatTokens,
@@ -1337,6 +1349,12 @@ function shouldRecoverPersistedSubagents(reason: string): boolean {
   // "startup" is used when Pi opens the default session at process launch;
   // "resume" is used when explicitly opening a saved session.
   return reason === "startup" || reason === "resume";
+}
+
+function shouldRecoverSubagent(activity: Pick<SubagentActivityState, "phase" | "pendingQuestion">): boolean {
+  if (activity.phase === "done") return false;
+  if (activity.phase === "waiting") return activity.pendingQuestion === true;
+  return true;
 }
 
 function startWidgetRefresh() {
@@ -1472,7 +1490,7 @@ async function watchSubagent(
         if (parentSessionFile && switchSession) {
           void switchSession(parentSessionFile, {
             withSession: async (nextCtx) => {
-              sendActiveMessage = nextCtx.sendMessage.bind(nextCtx);
+              bindActiveSessionSender(nextCtx.sendMessage.bind(nextCtx));
               switchFocusedSession = (sessionFile, options) => nextCtx.switchSession(sessionFile, options);
               nextCtx.ui.notify(`Subagent ${name} finished; focus returned to parent.`, nativeError ? "error" : "info");
             },
@@ -1593,7 +1611,7 @@ async function resumePersistedSubagents(
     if (Array.from(runningSubagents.values()).some((running) => running.sessionFile === sessionFile)) continue;
 
     const activityRead = readSubagentActivityFile(entry.activityFile, entry.runningChildId);
-    if (!activityRead.ok || activityRead.activity.phase === "done") continue;
+    if (!activityRead.ok || !shouldRecoverSubagent(activityRead.activity)) continue;
     const loadout = readSubagentLoadout(sessionFile);
     if (!loadout) continue;
 
@@ -1663,7 +1681,7 @@ async function resumePersistedSubagents(
 }
 
 export default function subagentsExtension(pi: ExtensionAPI) {
-  sendActiveMessage = pi.sendMessage.bind(pi);
+  bindActiveSessionSender(pi.sendMessage.bind(pi));
   // Capture the UI context for widget updates
   pi.on("session_start", (event, ctx) => {
     latestCtx = ctx;
@@ -1707,6 +1725,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
   // Clean up on session shutdown
   pi.on("session_shutdown", (event, _ctx) => {
+    // The session-bound sender becomes invalid at this boundary. A matching
+    // withSession callback installs the replacement sender after a switch.
+    clearActiveSessionSender();
     const targetSessionFile = (event as any).targetSessionFile as string | undefined;
     const switchingFocusedSession =
       (event as any).reason === "resume" &&
@@ -2535,7 +2556,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         if (parentSessionFile && switchSession) {
           const switched = await switchSession(parentSessionFile, {
             withSession: async (nextCtx) => {
-              sendActiveMessage = nextCtx.sendMessage.bind(nextCtx);
+              bindActiveSessionSender(nextCtx.sendMessage.bind(nextCtx));
               switchFocusedSession = (sessionFile, options) => nextCtx.switchSession(sessionFile, options);
               nextCtx.ui.notify("Focus returned to parent agent.", "info");
             },
@@ -2563,7 +2584,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       focusedSubagentId = match.id;
       const switched = await ctx.switchSession(match.sessionFile, {
         withSession: async (nextCtx) => {
-          sendActiveMessage = nextCtx.sendMessage.bind(nextCtx);
+          bindActiveSessionSender(nextCtx.sendMessage.bind(nextCtx));
           switchFocusedSession = (sessionFile, options) => nextCtx.switchSession(sessionFile, options);
           nextCtx.ui.notify(`Focused on ${match.name}. Use /subagent-focus parent to return.`, "info");
         },
