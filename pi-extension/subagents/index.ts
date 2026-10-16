@@ -681,6 +681,8 @@ const RUNNING_CHILDREN_COUNT_KEY = Symbol.for("pi-subagents/running-children-cou
 let latestCtx: ExtensionContext | null = null;
 /** Latest ExtensionAPI, used to deliver ask_question notifications from the watcher. */
 let latestPi: ExtensionAPI | null = null;
+/** Send method rebound from withSession after session replacement. */
+let sendActiveMessage: ((message: any, options?: any) => Promise<void>) | null = null;
 
 /** Interval timer for widget re-renders. */
 let widgetInterval: ReturnType<typeof setInterval> | null = null;
@@ -1368,7 +1370,7 @@ function deliverPendingQuestion(running: RunningSubagent): boolean {
   const elapsed = Math.floor((Date.now() - running.startTime) / 1000);
   const replyHint = `\n\nReply with subagent_message({ name: "${name}", message: "…" }) — the same name works whether it is still running or has since exited. It stays open until you reply.`;
 
-  latestPi?.sendMessage(
+  (sendActiveMessage ?? latestPi?.sendMessage.bind(latestPi))?.(
     {
       customType: "subagent_question",
       content: `Sub-agent "${name}" asks (${formatElapsed(elapsed)}):\n\n${payload.question}${replyHint}`,
@@ -1394,7 +1396,7 @@ function deliverPendingSubagentEvents(running: RunningSubagent): void {
     const content = isProgress
       ? `Subagent "${running.name}" progress${event.percent === undefined ? "" : ` (${event.percent}%)`}: ${event.message}`
       : `Subagent "${running.name}" published artifact: ${event.path}${event.description ? ` — ${event.description}` : ""}`;
-    latestPi?.sendMessage({
+    (sendActiveMessage ?? latestPi?.sendMessage.bind(latestPi))?.({
       customType: isProgress ? "subagent_progress" : "subagent_artifact",
       content,
       display: true,
@@ -1454,6 +1456,7 @@ async function watchSubagent(
         if (parentSessionFile && switchSession) {
           void switchSession(parentSessionFile, {
             withSession: async (nextCtx) => {
+              sendActiveMessage = nextCtx.sendMessage.bind(nextCtx);
               switchFocusedSession = (sessionFile, options) => nextCtx.switchSession(sessionFile, options);
               nextCtx.ui.notify(`Subagent ${name} finished; focus returned to parent.`, nativeError ? "error" : "info");
             },
@@ -1648,6 +1651,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   // Capture the UI context for widget updates
   pi.on("session_start", (event, ctx) => {
     latestCtx = ctx;
+    sendActiveMessage = pi.sendMessage.bind(pi);
     // pi runs multiple sessions in one process. A prior session's shutdown
     // aborts the shared module poll-abort controller; install a fresh one so
     // subagents spawned in this session aren't watched against a dead signal.
@@ -2452,7 +2456,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         nativeRunning.abortController = nativeAbort;
         void watchSubagent(nativeRunning, nativeAbort.signal).then((result) => {
           updateWidget();
-          pi.sendMessage({
+          (sendActiveMessage ?? pi.sendMessage.bind(pi))({
             customType: "subagent_result",
             content: resolveResultPresentation(result, name),
             display: true,
@@ -2516,6 +2520,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         if (parentSessionFile && switchSession) {
           const switched = await switchSession(parentSessionFile, {
             withSession: async (nextCtx) => {
+              sendActiveMessage = nextCtx.sendMessage.bind(nextCtx);
               switchFocusedSession = (sessionFile, options) => nextCtx.switchSession(sessionFile, options);
               nextCtx.ui.notify("Focus returned to parent agent.", "info");
             },
@@ -2543,6 +2548,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       focusedSubagentId = match.id;
       const switched = await ctx.switchSession(match.sessionFile, {
         withSession: async (nextCtx) => {
+          sendActiveMessage = nextCtx.sendMessage.bind(nextCtx);
           switchFocusedSession = (sessionFile, options) => nextCtx.switchSession(sessionFile, options);
           nextCtx.ui.notify(`Focused on ${match.name}. Use /subagent-focus parent to return.`, "info");
         },
