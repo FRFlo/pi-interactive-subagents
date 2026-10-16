@@ -1912,6 +1912,31 @@ describe("commands", () => {
 });
 
 describe("tool registration", () => {
+  it("clears the session widget before switching contexts", () => {
+    const clearWidget = (subagentsModule as any).__test__.clearSubagentWidget;
+    const calls: unknown[][] = [];
+    clearWidget({ hasUI: true, ui: { setWidget: (...args: unknown[]) => calls.push(args) } });
+    assert.deepEqual(calls, [["subagent-status", undefined]]);
+  });
+
+  it("rejects watcher delivery once its session has shut down", () => {
+    const isSessionActive = (subagentsModule as any).__test__.isSessionActive;
+    const controller = new AbortController();
+    assert.equal(isSessionActive(controller.signal), true);
+    controller.abort();
+    assert.equal(isSessionActive(controller.signal), false);
+  });
+
+  it("routes delayed sends through the latest sender after extension reload", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const sent: string[] = [];
+    testApi.bindActiveSessionSender(async () => { sent.push("old"); });
+    testApi.bindActiveSessionSender(async () => { sent.push("current"); });
+    testApi.sendToActiveSession({ customType: "subagent_result", content: "late" });
+    assert.deepEqual(sent, ["current"]);
+    testApi.clearActiveSessionSender();
+  });
+
   it("does not send through a session context after shutdown invalidates it", () => {
     const testApi = (subagentsModule as any).__test__;
     let sent = 0;

@@ -681,19 +681,32 @@ const RUNNING_CHILDREN_COUNT_KEY = Symbol.for("pi-subagents/running-children-cou
 let latestCtx: ExtensionContext | null = null;
 /** Send method rebound from withSession after session replacement. */
 let sendActiveMessage: ((message: any, options?: any) => Promise<void>) | null = null;
+const ACTIVE_SESSION_SENDER_KEY = Symbol.for("pi-subagents/active-session-sender");
+let hasStartedSession = false;
 
 function bindActiveSessionSender(sendMessage: (message: any, options?: any) => Promise<void>): void {
-  sendActiveMessage = sendMessage;
+  const sender = sendMessage;
+  sendActiveMessage = sender;
+  (globalThis as any)[ACTIVE_SESSION_SENDER_KEY] = sender;
 }
 
 function clearActiveSessionSender(): void {
+  const activeSender = (globalThis as any)[ACTIVE_SESSION_SENDER_KEY];
+  if (activeSender === sendActiveMessage) {
+    (globalThis as any)[ACTIVE_SESSION_SENDER_KEY] = null;
+  }
   sendActiveMessage = null;
 }
 
+function isSessionActive(signal: AbortSignal): boolean {
+  return !signal.aborted;
+}
+
 function sendToActiveSession(message: any, options?: any): void {
-  if (!sendActiveMessage) return;
+  const sender = (globalThis as any)[ACTIVE_SESSION_SENDER_KEY] ?? sendActiveMessage;
+  if (!sender) return;
   try {
-    void sendActiveMessage(message, options).catch((error) => {
+    void sender(message, options).catch((error) => {
       console.error("Failed to send subagent message to the active session:", error);
     });
   } catch (error) {
@@ -841,8 +854,12 @@ function updateWidget() {
         },
       };
     },
-    { placement: "aboveEditor" },
+    { placement: "belowEditor" },
   );
+}
+
+function clearSubagentWidget(ctx: { hasUI?: boolean; ui: { setWidget: (id: string, widget: undefined) => void } }): void {
+  if (ctx.hasUI) ctx.ui.setWidget("subagent-status", undefined);
 }
 
 /**
@@ -1336,6 +1353,8 @@ export const __test__ = {
   bindActiveSessionSender,
   clearActiveSessionSender,
   sendToActiveSession,
+  isSessionActive,
+  clearSubagentWidget,
   runningSubagents,
   formatElapsed,
   formatTokens,
@@ -1645,7 +1664,7 @@ async function resumePersistedSubagents(
       startWidgetRefresh();
       startStatusRefresh(pi);
       void watchSubagent(running, signal).then((result) => {
-        if (signal.aborted) return;
+        if (!isSessionActive(signal)) return;
         updateWidget();
         const presentation = resolveResultPresentation(result, running.name);
         sendToActiveSession({
@@ -1681,9 +1700,15 @@ async function resumePersistedSubagents(
 }
 
 export default function subagentsExtension(pi: ExtensionAPI) {
-  bindActiveSessionSender(pi.sendMessage.bind(pi));
   // Capture the UI context for widget updates
   pi.on("session_start", (event, ctx) => {
+    // Extensions can be initialized before Pi has restored the requested
+    // session. Bind only on the first start; later replacements must rebind
+    // through their withSession callback, not this captured ExtensionAPI.
+    if (!hasStartedSession) {
+      bindActiveSessionSender(pi.sendMessage.bind(pi));
+      hasStartedSession = true;
+    }
     latestCtx = ctx;
     // pi runs multiple sessions in one process. A prior session's shutdown
     // aborts the shared module poll-abort controller; install a fresh one so
@@ -1724,10 +1749,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   });
 
   // Clean up on session shutdown
-  pi.on("session_shutdown", (event, _ctx) => {
+  pi.on("session_shutdown", (event, ctx) => {
     // The session-bound sender becomes invalid at this boundary. A matching
     // withSession callback installs the replacement sender after a switch.
     clearActiveSessionSender();
+    clearSubagentWidget(ctx);
+    if (latestCtx === ctx) latestCtx = null;
     const targetSessionFile = (event as any).targetSessionFile as string | undefined;
     const switchingFocusedSession =
       (event as any).reason === "resume" &&
@@ -1920,6 +1947,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // Fire-and-forget: start watching in background
         watchSubagent(running, watcherAbort.signal)
           .then((result) => {
+            if (!isSessionActive(watcherAbort.signal)) return;
             updateWidget(); // reflect removal from Map immediately
 
             const presentation = resolveResultPresentation(result, running.name);
@@ -1945,6 +1973,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             );
           })
           .catch((err) => {
+            if (!isSessionActive(watcherAbort.signal)) return;
             updateWidget();
             sendToActiveSession(
               {
@@ -2122,6 +2151,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     const abort = new AbortController();
     running.abortController = abort;
     void watchSubagent(running, abort.signal).then((result) => {
+      if (!isSessionActive(abort.signal)) return;
       updateWidget();
       sendToActiveSession({
         customType: "subagent_result",
@@ -2491,6 +2521,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const nativeAbort = new AbortController();
         nativeRunning.abortController = nativeAbort;
         void watchSubagent(nativeRunning, nativeAbort.signal).then((result) => {
+          if (!isSessionActive(nativeAbort.signal)) return;
           updateWidget();
           sendToActiveSession({
             customType: "subagent_result",
