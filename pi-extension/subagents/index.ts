@@ -67,6 +67,7 @@ const SUBAGENTS_DIR = dirname(fileURLToPath(import.meta.url));
 const WIDGET_INTERVAL_KEY = Symbol.for("pi-subagents/widget-interval");
 const STATUS_INTERVAL_KEY = Symbol.for("pi-subagents/status-interval");
 const POLL_ABORT_KEY = Symbol.for("pi-subagents/poll-abort-controller");
+const PENDING_RELOAD_SUBAGENTS_KEY = Symbol.for("pi-subagents/pending-reload-subagents");
 
 {
   const prevInterval = (globalThis as any)[WIDGET_INTERVAL_KEY];
@@ -1362,6 +1363,7 @@ export const __test__ = {
   handleSubagentSteer,
   resolveResultPresentation,
   resolveResumeLaunchBehavior,
+  takePendingReloadSubagents,
   pendingQuestionForRecovery,
   shouldRecoverSubagent,
   shouldRecoverPersistedSubagents,
@@ -1380,9 +1382,14 @@ export const __test__ = {
 };
 
 function shouldRecoverPersistedSubagents(reason: string): boolean {
-  // "startup" is used when Pi opens the default session at process launch;
-  // "resume" is used when explicitly opening a saved session.
-  return reason === "startup" || reason === "resume";
+  // "reload" is used when Pi rebuilds the extension runtime in-place.
+  return reason === "startup" || reason === "resume" || reason === "reload";
+}
+
+function takePendingReloadSubagents(reason: string): RunningSubagent[] {
+  const pending = (globalThis as any)[PENDING_RELOAD_SUBAGENTS_KEY] as RunningSubagent[] | undefined;
+  delete (globalThis as any)[PENDING_RELOAD_SUBAGENTS_KEY];
+  return reason === "reload" && Array.isArray(pending) ? pending : [];
 }
 
 function shouldRecoverSubagent(activity: Pick<SubagentActivityState, "phase" | "pendingQuestion">): boolean {
@@ -1714,9 +1721,49 @@ async function resumePersistedSubagents(
   }
 }
 
+function watchAndReportSubagent(running: RunningSubagent, signal: AbortSignal): void {
+  void watchSubagent(running, signal).then((result) => {
+    if (!isSessionActive(signal)) return;
+    updateWidget();
+    sendToActiveSession({
+      customType: "subagent_result",
+      content: resolveResultPresentation(result, running.name),
+      display: true,
+      details: {
+        name: running.name,
+        task: running.task,
+        agent: running.agent,
+        exitCode: result.exitCode,
+        elapsed: result.elapsed,
+        sessionFile: result.sessionFile,
+        sessionId: result.sessionId,
+        stats: result.stats,
+        error: result.error,
+      },
+    }, { triggerTurn: true });
+  }).catch((error) => {
+    if (!signal.aborted) {
+      const content = `Could not watch resumed subagent ${running.name}: ${error instanceof Error ? error.message : String(error)}`;
+      sendToActiveSession({
+        customType: "subagent_status",
+        content,
+        display: true,
+        details: { lines: [content], overflow: 0 },
+      }, { triggerTurn: true, deliverAs: "steer" });
+    }
+  });
+}
+
 export default function subagentsExtension(pi: ExtensionAPI) {
   // Capture the UI context for widget updates
   pi.on("session_start", (event, ctx) => {
+    const isFirstStartInExtensionRuntime = !hasStartedSession;
+    const pendingReloadSubagents = takePendingReloadSubagents(
+      isFirstStartInExtensionRuntime ? event.reason : "session-switch",
+    );
+    if (isFirstStartInExtensionRuntime) {
+      for (const running of pendingReloadSubagents) runningSubagents.set(running.id, running);
+    }
     // Extensions can be initialized before Pi has restored the requested
     // session. Bind only on the first start; later replacements must rebind
     // through their withSession callback, not this captured ExtensionAPI.
@@ -1736,6 +1783,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     if (runningSubagents.size > 0) {
       startWidgetRefresh();
       startStatusRefresh(pi);
+    }
+    if (isFirstStartInExtensionRuntime && event.reason === "reload") {
+      for (const running of runningSubagents.values()) {
+        const controller = new AbortController();
+        running.abortController = controller;
+        watchAndReportSubagent(running, controller.signal);
+      }
     }
     if (shouldRecoverPersistedSubagents(event.reason)) {
       void resumePersistedSubagents(ctx, pi).catch((error) => {
@@ -1803,6 +1857,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     }
     const moduleAbort = (globalThis as any)[POLL_ABORT_KEY] as AbortController | undefined;
     if (moduleAbort) moduleAbort.abort();
+    (globalThis as any)[PENDING_RELOAD_SUBAGENTS_KEY] = Array.from(runningSubagents.values());
     for (const [_id, agent] of runningSubagents) {
       agent.abortController?.abort();
     }

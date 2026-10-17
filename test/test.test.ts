@@ -1958,13 +1958,27 @@ describe("tool registration", () => {
     assert.equal(sent, 0);
   });
 
-  it("recovers persisted subagents on startup and explicit resume", () => {
+  it("recovers persisted subagents on startup, resume, and extension reload", () => {
     const shouldRecover = (subagentsModule as any).__test__.shouldRecoverPersistedSubagents;
     assert.equal(shouldRecover("startup"), true);
     assert.equal(shouldRecover("resume"), true);
+    assert.equal(shouldRecover("reload"), true);
     assert.equal(shouldRecover("new"), false);
-    assert.equal(shouldRecover("reload"), false);
     assert.equal(shouldRecover("fork"), false);
+  });
+
+  it("restores live subagent handles only for an extension reload", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const key = Symbol.for("pi-subagents/pending-reload-subagents");
+    const running = { id: "reload-child", name: "Worker" };
+
+    (globalThis as any)[key] = [running];
+    assert.deepEqual(testApi.takePendingReloadSubagents("reload"), [running]);
+    assert.equal((globalThis as any)[key], undefined);
+
+    (globalThis as any)[key] = [running];
+    assert.deepEqual(testApi.takePendingReloadSubagents("resume"), []);
+    assert.equal((globalThis as any)[key], undefined);
   });
 
   it("only recovers unfinished activity or a pending question", () => {
