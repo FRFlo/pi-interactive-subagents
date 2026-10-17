@@ -1937,6 +1937,18 @@ describe("tool registration", () => {
     testApi.clearActiveSessionSender();
   });
 
+  it("accepts session senders that return void", () => {
+    const testApi = (subagentsModule as any).__test__;
+    let sent = 0;
+    testApi.bindActiveSessionSender(() => { sent++; });
+    try {
+      testApi.sendToActiveSession({ customType: "subagent_result", content: "late" });
+      assert.equal(sent, 1);
+    } finally {
+      testApi.clearActiveSessionSender();
+    }
+  });
+
   it("does not send through a session context after shutdown invalidates it", () => {
     const testApi = (subagentsModule as any).__test__;
     let sent = 0;

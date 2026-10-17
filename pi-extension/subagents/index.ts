@@ -706,7 +706,7 @@ function sendToActiveSession(message: any, options?: any): void {
   const sender = (globalThis as any)[ACTIVE_SESSION_SENDER_KEY] ?? sendActiveMessage;
   if (!sender) return;
   try {
-    void sender(message, options).catch((error) => {
+    void Promise.resolve(sender(message, options)).catch((error) => {
       console.error("Failed to send subagent message to the active session:", error);
     });
   } catch (error) {
