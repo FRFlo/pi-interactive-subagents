@@ -2539,6 +2539,33 @@ describe("subagent interruption", () => {
     assert.match(result.error, /Failed to deliver message/);
   });
 
+  it("surfaces asynchronous steering failures without an unhandled rejection", async () => {
+    const testApi = (subagentsModule as any).__test__;
+    const sent: any[] = [];
+    const originalConsoleError = console.error;
+    testApi.bindActiveSessionSender(async (message: any) => { sent.push(message); });
+    console.error = () => {};
+    try {
+      const running = makeRunning({
+        native: {
+          session: {
+            isStreaming: true,
+            steer: () => Promise.reject(new Error("stale extension context")),
+          },
+        },
+      });
+
+      assert.deepEqual(testApi.steerSubagent(running, "continue"), { ok: true });
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(sent.length, 1);
+      assert.equal(sent[0].customType, "subagent_status");
+      assert.match(sent[0].details.lines[0], /Failed to deliver message.*stale extension context/);
+    } finally {
+      console.error = originalConsoleError;
+      testApi.clearActiveSessionSender();
+    }
+  });
+
   it("delivers a steer message and forces local status waiting", async () => {
     const testApi = (subagentsModule as any).__test__;
     const runningMap = testApi.runningSubagents as Map<string, any>;

@@ -1017,9 +1017,24 @@ function steerSubagent(
   const flattened = message.replace(/\s*\n\s*/g, " ").trim();
   try {
     if (!running.native) throw new Error("Subagent session is unavailable");
-    void ((running.native.session as any).isStreaming
+    const delivery = (running.native.session as any).isStreaming
       ? running.native.session.steer(flattened)
-      : running.native.session.prompt(flattened));
+      : running.native.session.prompt(flattened);
+    void delivery.catch((error: unknown) => {
+      const detail = error instanceof Error ? error.message : String(error);
+      const failure = `Failed to deliver message to subagent "${running.name}": ${detail}`;
+      (running as any).nativeError = detail;
+      console.error(failure);
+      sendToActiveSession(
+        {
+          customType: "subagent_status",
+          content: failure,
+          display: true,
+          details: { lines: [failure], overflow: 0 },
+        },
+        { triggerTurn: true, deliverAs: "steer" },
+      );
+    });
     return { ok: true };
   } catch (error: any) {
     return {
