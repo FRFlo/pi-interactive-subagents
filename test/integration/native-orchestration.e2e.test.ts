@@ -185,7 +185,17 @@ describe("native subagent orchestration (E2E)", () => {
       },
     } as any;
     extensionTestApi.runningSubagents.clear();
+    extensionTestApi.clearActiveSessionSender();
+    extensionTestApi.sendToActiveSession(
+      { customType: "subagent_result", content: "queued completion", display: true },
+      { triggerTurn: true, deliverAs: "steer" },
+    );
+    extensionTestApi.bindActiveSessionSender(api.sendMessage.bind(api));
     try {
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(completions[0]?.content, "queued completion");
+      completions.length = 0;
+
       faux.setResponses([fauxAssistantMessage("fork complete")]);
       let done = completion();
       const fork = tools.find((tool) => tool.name === "subagent_fork");
@@ -202,6 +212,7 @@ describe("native subagent orchestration (E2E)", () => {
       await done;
       assert.match(completions.at(-1).content, /restart complete/);
     } finally {
+      extensionTestApi.clearActiveSessionSender();
       extensionTestApi.runningSubagents.clear();
     }
   });

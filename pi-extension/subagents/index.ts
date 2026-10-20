@@ -684,11 +684,41 @@ let latestCtx: ExtensionContext | null = null;
 let sendActiveMessage: ((message: any, options?: any) => Promise<void>) | null = null;
 const ACTIVE_SESSION_SENDER_KEY = Symbol.for("pi-subagents/active-session-sender");
 let hasStartedSession = false;
+const pendingActiveMessages: Array<{ message: any; options?: any }> = [];
+let flushingActiveMessages = false;
 
 function bindActiveSessionSender(sendMessage: (message: any, options?: any) => Promise<void>): void {
   const sender = sendMessage;
   sendActiveMessage = sender;
   (globalThis as any)[ACTIVE_SESSION_SENDER_KEY] = sender;
+  flushPendingActiveMessages(sender);
+}
+
+function flushPendingActiveMessages(sender: (message: any, options?: any) => Promise<void>): void {
+  if (flushingActiveMessages || pendingActiveMessages.length === 0) return;
+  flushingActiveMessages = true;
+  void (async () => {
+    try {
+      while (pendingActiveMessages.length > 0) {
+        const pending = pendingActiveMessages[0];
+        try {
+          await sender(pending.message, pending.options);
+          pendingActiveMessages.shift();
+        } catch (error) {
+          reportMessageDeliveryFailure(error);
+          break;
+        }
+      }
+    } finally {
+      flushingActiveMessages = false;
+    }
+  })();
+}
+
+function reportMessageDeliveryFailure(error: unknown): void {
+  const detail = error instanceof Error ? error.message : String(error);
+  console.error("Failed to send subagent message to the active session:", error);
+  latestCtx?.ui.notify(`Subagent notification could not be delivered: ${detail}`, "error");
 }
 
 function clearActiveSessionSender(): void {
@@ -705,13 +735,20 @@ function isSessionActive(signal: AbortSignal): boolean {
 
 function sendToActiveSession(message: any, options?: any): void {
   const sender = (globalThis as any)[ACTIVE_SESSION_SENDER_KEY] ?? sendActiveMessage;
-  if (!sender) return;
+  if (!sender) {
+    if (message?.customType === "subagent_result" || message?.customType === "subagent_question") {
+      pendingActiveMessages.push({ message, options });
+    } else {
+      latestCtx?.ui.notify(message?.content ?? "Subagent notification could not be delivered.", "warning");
+    }
+    return;
+  }
   try {
     void Promise.resolve(sender(message, options)).catch((error) => {
-      console.error("Failed to send subagent message to the active session:", error);
+      reportMessageDeliveryFailure(error);
     });
   } catch (error) {
-    console.error("Failed to send subagent message to the active session:", error);
+    reportMessageDeliveryFailure(error);
   }
 }
 

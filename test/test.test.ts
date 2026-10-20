@@ -2571,9 +2571,11 @@ describe("subagent interruption", () => {
 
       assert.deepEqual(testApi.steerSubagent(running, "continue"), { ok: true });
       await new Promise((resolve) => setImmediate(resolve));
-      assert.equal(sent.length, 1);
-      assert.equal(sent[0].customType, "subagent_status");
-      assert.match(sent[0].details.lines[0], /Failed to deliver message.*stale extension context/);
+      const failureMessage = sent.find((message) =>
+        message.customType === "subagent_status" &&
+        message.details.lines[0].includes("stale extension context"),
+      );
+      assert.ok(failureMessage, "expected the asynchronous steering failure to reach the parent");
     } finally {
       console.error = originalConsoleError;
       testApi.clearActiveSessionSender();
