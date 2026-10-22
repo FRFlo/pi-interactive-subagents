@@ -1937,6 +1937,34 @@ describe("tool registration", () => {
     testApi.clearActiveSessionSender();
   });
 
+  it("queues completion for its parent and flushes only when that parent returns", async () => {
+    const testApi = (subagentsModule as any).__test__;
+    const sent: string[] = [];
+    testApi.bindActiveSessionSender(async () => { sent.push("A"); }, "/parent/A");
+    testApi.bindActiveSessionSender(async () => { sent.push("B"); }, "/parent/B");
+    testApi.sendToActiveSession({ customType: "subagent_result", content: "A result" }, undefined, "/parent/A");
+    await Promise.resolve();
+    assert.deepEqual(sent, []);
+    testApi.bindActiveSessionSender(async () => { sent.push("A-returned"); }, "/parent/A");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.deepEqual(sent, ["A-returned"]);
+    testApi.clearActiveSessionSender();
+  });
+
+  it("retains live child handles by parent session until completion", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const parentSessionFile = "/sessions/parent-a.jsonl";
+    const running = {
+      id: "retained-child",
+      parentSessionFile,
+      sessionFile: "/sessions/child.jsonl",
+    };
+    testApi.retainSessionSubagents(parentSessionFile, [running]);
+    assert.deepEqual(testApi.getSessionSubagents(parentSessionFile), [running]);
+    testApi.removeRetainedSubagent(parentSessionFile, running.sessionFile);
+    assert.deepEqual(testApi.getSessionSubagents(parentSessionFile), []);
+  });
+
   it("accepts session senders that return void", () => {
     const testApi = (subagentsModule as any).__test__;
     let sent = 0;

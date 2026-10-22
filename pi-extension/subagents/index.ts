@@ -68,6 +68,10 @@ const WIDGET_INTERVAL_KEY = Symbol.for("pi-subagents/widget-interval");
 const STATUS_INTERVAL_KEY = Symbol.for("pi-subagents/status-interval");
 const POLL_ABORT_KEY = Symbol.for("pi-subagents/poll-abort-controller");
 const PENDING_RELOAD_SUBAGENTS_KEY = Symbol.for("pi-subagents/pending-reload-subagents");
+const SESSION_SUBAGENTS_KEY = Symbol.for("pi-subagents/session-subagents");
+const SESSION_MESSAGES_KEY = Symbol.for("pi-subagents/session-messages");
+const ACTIVE_PARENT_SESSION_KEY = Symbol.for("pi-subagents/active-parent-session");
+const ACTIVE_RUNNING_MAP_KEY = Symbol.for("pi-subagents/active-running-map");
 
 {
   const prevInterval = (globalThis as any)[WIDGET_INTERVAL_KEY];
@@ -627,6 +631,7 @@ interface SubagentResult {
  * State for a launched (but not yet completed) subagent.
  */
 interface RunningSubagent {
+  parentSessionFile: string;
   id: string;
   name: string;
   task: string;
@@ -684,26 +689,30 @@ let latestCtx: ExtensionContext | null = null;
 let sendActiveMessage: ((message: any, options?: any) => Promise<void>) | null = null;
 const ACTIVE_SESSION_SENDER_KEY = Symbol.for("pi-subagents/active-session-sender");
 let hasStartedSession = false;
-const pendingActiveMessages: Array<{ message: any; options?: any }> = [];
+const pendingActiveMessages: Array<{ parentSessionFile: string; message: any; options?: any }> =
+  (globalThis as any)[SESSION_MESSAGES_KEY] ?? ((globalThis as any)[SESSION_MESSAGES_KEY] = []);
 let flushingActiveMessages = false;
 
-function bindActiveSessionSender(sendMessage: (message: any, options?: any) => Promise<void>): void {
+function bindActiveSessionSender(sendMessage: (message: any, options?: any) => Promise<void>, parentSessionFile = ""): void {
   const sender = sendMessage;
   sendActiveMessage = sender;
   (globalThis as any)[ACTIVE_SESSION_SENDER_KEY] = sender;
-  flushPendingActiveMessages(sender);
+  (globalThis as any)[ACTIVE_PARENT_SESSION_KEY] = parentSessionFile;
+  flushPendingActiveMessages(sender, parentSessionFile);
 }
 
-function flushPendingActiveMessages(sender: (message: any, options?: any) => Promise<void>): void {
+function flushPendingActiveMessages(sender: (message: any, options?: any) => Promise<void>, parentSessionFile: string): void {
   if (flushingActiveMessages || pendingActiveMessages.length === 0) return;
   flushingActiveMessages = true;
   void (async () => {
     try {
-      while (pendingActiveMessages.length > 0) {
-        const pending = pendingActiveMessages[0];
+      while (true) {
+        const index = pendingActiveMessages.findIndex((pending) => pending.parentSessionFile === parentSessionFile);
+        if (index < 0) break;
+        const pending = pendingActiveMessages[index];
         try {
           await sender(pending.message, pending.options);
-          pendingActiveMessages.shift();
+          pendingActiveMessages.splice(index, 1);
         } catch (error) {
           reportMessageDeliveryFailure(error);
           break;
@@ -725,6 +734,7 @@ function clearActiveSessionSender(): void {
   const activeSender = (globalThis as any)[ACTIVE_SESSION_SENDER_KEY];
   if (activeSender === sendActiveMessage) {
     (globalThis as any)[ACTIVE_SESSION_SENDER_KEY] = null;
+    (globalThis as any)[ACTIVE_PARENT_SESSION_KEY] = null;
   }
   sendActiveMessage = null;
 }
@@ -733,15 +743,21 @@ function isSessionActive(signal: AbortSignal): boolean {
   return !signal.aborted;
 }
 
-function sendToActiveSession(message: any, options?: any): void {
+function sendToActiveSession(message: any, options?: any, parentSessionFile = (globalThis as any)[ACTIVE_PARENT_SESSION_KEY] ?? ""): void {
   const sender = (globalThis as any)[ACTIVE_SESSION_SENDER_KEY] ?? sendActiveMessage;
-  if (!sender) {
-    if (message?.customType === "subagent_result" || message?.customType === "subagent_question") {
-      pendingActiveMessages.push({ message, options });
+  if (!sender || (globalThis as any)[ACTIVE_PARENT_SESSION_KEY] !== parentSessionFile) {
+    if (parentSessionFile) {
+      pendingActiveMessages.push({ parentSessionFile, message, options });
+      if (message?.customType === "subagent_result") {
+        removeRetainedSubagent(parentSessionFile, message.details?.sessionFile);
+      }
     } else {
       latestCtx?.ui.notify(message?.content ?? "Subagent notification could not be delivered.", "warning");
     }
     return;
+  }
+  if (message?.customType === "subagent_result") {
+    removeRetainedSubagent(parentSessionFile, message.details?.sessionFile);
   }
   try {
     void Promise.resolve(sender(message, options)).catch((error) => {
@@ -750,6 +766,34 @@ function sendToActiveSession(message: any, options?: any): void {
   } catch (error) {
     reportMessageDeliveryFailure(error);
   }
+}
+
+function removeRetainedSubagent(parentSessionFile: string, childSessionFile?: string): void {
+  if (!childSessionFile) return;
+  const retained = (globalThis as any)[SESSION_SUBAGENTS_KEY] as Map<string, Map<string, RunningSubagent>> | undefined;
+  const runs = retained?.get(parentSessionFile);
+  runs?.delete(childSessionFile);
+  if (runs?.size === 0) retained?.delete(parentSessionFile);
+  const active = (globalThis as any)[ACTIVE_RUNNING_MAP_KEY] as { parentSessionFile: string; map: Map<string, RunningSubagent> } | undefined;
+  if (active?.parentSessionFile === parentSessionFile) {
+    for (const running of active.map.values()) {
+      if (running.sessionFile === childSessionFile) active.map.delete(running.id);
+    }
+  }
+}
+
+function retainSessionSubagents(parentSessionFile: string, running: Iterable<RunningSubagent>): void {
+  if (!parentSessionFile) return;
+  const retained = (globalThis as any)[SESSION_SUBAGENTS_KEY] as Map<string, Map<string, RunningSubagent>> | undefined;
+  const sessions = retained ?? ((globalThis as any)[SESSION_SUBAGENTS_KEY] = new Map<string, Map<string, RunningSubagent>>());
+  let bySessionFile = sessions.get(parentSessionFile);
+  if (!bySessionFile) sessions.set(parentSessionFile, bySessionFile = new Map());
+  for (const item of running) bySessionFile.set(item.sessionFile, item);
+}
+
+function getSessionSubagents(parentSessionFile: string): RunningSubagent[] {
+  const retained = (globalThis as any)[SESSION_SUBAGENTS_KEY] as Map<string, Map<string, RunningSubagent>> | undefined;
+  return Array.from(retained?.get(parentSessionFile)?.values() ?? []);
 }
 
 /** Interval timer for widget re-renders. */
@@ -1071,6 +1115,7 @@ function steerSubagent(
           details: { lines: [failure], overflow: 0 },
         },
         { triggerTurn: true, deliverAs: "steer" },
+        running.parentSessionFile,
       );
     });
     return { ok: true };
@@ -1261,6 +1306,7 @@ async function launchNativeSubagent(
     },
   });
   const running: RunningSubagent = {
+    parentSessionFile,
     id,
     name: params.name,
     task: params.task,
@@ -1273,6 +1319,7 @@ async function launchNativeSubagent(
     statusState: createStatusState({ source: "pi", startTimeMs: startTime }),
   };
   runningSubagents.set(id, running);
+  retainSessionSubagents(parentSessionFile, [running]);
   running.nativeRun = native.session.prompt(prompt).catch((error) => {
     (running as any).nativeError = error instanceof Error ? error.message : String(error);
   });
@@ -1304,7 +1351,7 @@ async function resumeNativeSubagent(
   message: string | null,
   sessionPath: string,
   loadout: SubagentLoadout,
-  ctx: { sessionManager: { getSessionDir(): string; getSessionId(): string }; cwd: string; model?: any },
+  ctx: { sessionManager: { getSessionFile(): string | null; getSessionDir(): string; getSessionId(): string }; cwd: string; model?: any },
   pendingQuestion?: { question: string; toolCallId?: string },
 ): Promise<RunningSubagent> {
   const startTime = Date.now();
@@ -1331,7 +1378,9 @@ async function resumeNativeSubagent(
       cwd: loadout.cwd ?? ctx.cwd,
     })(pi),
   });
+  const parentSessionFile = ctx.sessionManager.getSessionFile();
   const running: RunningSubagent = {
+    parentSessionFile,
     id,
     name,
     task: message ?? "Restored while waiting for parent input.",
@@ -1346,6 +1395,7 @@ async function resumeNativeSubagent(
     pendingQuestion: !!pendingQuestion,
   };
   runningSubagents.set(id, running);
+  retainSessionSubagents(parentSessionFile, [running]);
   const abortController = new AbortController();
   running.abortController = abortController;
   if (message === null) {
@@ -1364,7 +1414,7 @@ async function cloneNativeSubagent(
   sourceSession: string,
   loadout: SubagentLoadout,
   mode: "restart" | "fork",
-  ctx: { sessionManager: { getSessionDir(): string; getSessionId(): string }; cwd: string; model?: any },
+  ctx: { sessionManager: { getSessionFile(): string | null; getSessionDir(): string; getSessionId(): string }; cwd: string; model?: any },
 ): Promise<RunningSubagent> {
   const cwd = loadout.cwd ?? ctx.cwd;
   const targetSession = SessionManager.create(
@@ -1407,6 +1457,9 @@ export const __test__ = {
   bindActiveSessionSender,
   clearActiveSessionSender,
   sendToActiveSession,
+  retainSessionSubagents,
+  getSessionSubagents,
+  removeRetainedSubagent,
   isSessionActive,
   clearSubagentWidget,
   runningSubagents,
@@ -1495,6 +1548,7 @@ function deliverPendingQuestion(running: RunningSubagent): boolean {
       },
     },
     { triggerTurn: true, deliverAs: "steer" },
+    running.parentSessionFile,
   );
   return true;
 }
@@ -1513,7 +1567,7 @@ function deliverPendingSubagentEvents(running: RunningSubagent): void {
       content,
       display: true,
       details: { name: running.name, ...event },
-    }, { triggerTurn: false });
+    }, { triggerTurn: false }, running.parentSessionFile);
   }
 }
 
@@ -1568,7 +1622,7 @@ async function watchSubagent(
         if (parentSessionFile && switchSession) {
           void switchSession(parentSessionFile, {
             withSession: async (nextCtx) => {
-              bindActiveSessionSender(nextCtx.sendMessage.bind(nextCtx));
+              bindActiveSessionSender(nextCtx.sendMessage.bind(nextCtx), nextCtx.sessionManager.getSessionFile() ?? "");
               switchFocusedSession = (sessionFile, options) => nextCtx.switchSession(sessionFile, options);
               nextCtx.ui.notify(`Subagent ${name} finished; focus returned to parent.`, nativeError ? "error" : "info");
             },
@@ -1741,7 +1795,7 @@ async function resumePersistedSubagents(
             stats: result.stats,
             error: result.error,
           },
-        }, { triggerTurn: true });
+        }, { triggerTurn: true }, running.parentSessionFile);
       }).catch((error) => {
         if (!signal.aborted) {
           ctx.ui.notify(`Could not watch resumed subagent ${name}: ${error instanceof Error ? error.message : String(error)}`, "error");
@@ -1777,7 +1831,7 @@ function watchAndReportSubagent(running: RunningSubagent, signal: AbortSignal): 
         stats: result.stats,
         error: result.error,
       },
-    }, { triggerTurn: true });
+    }, { triggerTurn: true }, running.parentSessionFile);
   }).catch((error) => {
     if (!signal.aborted) {
       const content = `Could not watch resumed subagent ${running.name}: ${error instanceof Error ? error.message : String(error)}`;
@@ -1786,7 +1840,7 @@ function watchAndReportSubagent(running: RunningSubagent, signal: AbortSignal): 
         content,
         display: true,
         details: { lines: [content], overflow: 0 },
-      }, { triggerTurn: true, deliverAs: "steer" });
+      }, { triggerTurn: true, deliverAs: "steer" }, running.parentSessionFile);
     }
   });
 }
@@ -1801,14 +1855,20 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     if (isFirstStartInExtensionRuntime) {
       for (const running of pendingReloadSubagents) runningSubagents.set(running.id, running);
     }
-    // Extensions can be initialized before Pi has restored the requested
-    // session. Bind only on the first start; later replacements must rebind
-    // through their withSession callback, not this captured ExtensionAPI.
-    if (!hasStartedSession) {
-      bindActiveSessionSender(pi.sendMessage.bind(pi));
-      hasStartedSession = true;
-    }
+    // session_start is emitted for every Pi session replacement. The sender
+    // must follow the session that is now active, not the first one loaded.
+    bindActiveSessionSender(pi.sendMessage.bind(pi), ctx.sessionManager.getSessionFile() ?? "");
+    hasStartedSession = true;
     latestCtx = ctx;
+    const sessionFile = ctx.sessionManager.getSessionFile();
+    const retainedRuns = sessionFile ? getSessionSubagents(sessionFile) : [];
+    (globalThis as any)[ACTIVE_RUNNING_MAP_KEY] = {
+      parentSessionFile: sessionFile ?? "",
+      map: runningSubagents,
+    };
+    if (retainedRuns?.length) {
+      for (const running of retainedRuns) runningSubagents.set(running.id, running);
+    }
     // pi runs multiple sessions in one process. A prior session's shutdown
     // aborts the shared module poll-abort controller; install a fresh one so
     // subagents spawned in this session aren't watched against a dead signal.
@@ -1861,9 +1921,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     clearActiveSessionSender();
     clearSubagentWidget(ctx);
     if (latestCtx === ctx) latestCtx = null;
+    const activeRunning = (globalThis as any)[ACTIVE_RUNNING_MAP_KEY] as { map: Map<string, RunningSubagent> } | undefined;
+    if (activeRunning?.map === runningSubagents) (globalThis as any)[ACTIVE_RUNNING_MAP_KEY] = null;
     const targetSessionFile = (event as any).targetSessionFile as string | undefined;
+    const reason = (event as any).reason as string;
+    const parentSessionFile = ctx.sessionManager.getSessionFile() ?? "";
     const switchingFocusedSession =
-      (event as any).reason === "resume" &&
+      reason === "resume" &&
       !!targetSessionFile &&
       (targetSessionFile === focusedParentSessionFile ||
         Array.from(runningSubagents.values()).some((running) => running.sessionFile === targetSessionFile));
@@ -1881,7 +1945,17 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       }
       return;
     }
-
+    if (["new", "resume", "fork"].includes(reason) && parentSessionFile) {
+      retainSessionSubagents(parentSessionFile, runningSubagents.values());
+      runningSubagents.clear();
+      if (widgetInterval) clearInterval(widgetInterval);
+      if (statusInterval) clearInterval(statusInterval);
+      widgetInterval = null;
+      statusInterval = null;
+      (globalThis as any)[WIDGET_INTERVAL_KEY] = null;
+      (globalThis as any)[STATUS_INTERVAL_KEY] = null;
+      return;
+    }
     if (widgetInterval) {
       clearInterval(widgetInterval);
       widgetInterval = null;
@@ -2077,6 +2151,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                 },
               },
               { triggerTurn: true, deliverAs: "steer" },
+              running.parentSessionFile,
             );
           })
           .catch((err) => {
@@ -2087,9 +2162,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                 customType: "subagent_result",
                 content: `Sub-agent "${running.name}" error: ${err?.message ?? String(err)}`,
                 display: true,
-                details: { name: running.name, task: running.task, error: err?.message },
+                details: { name: running.name, task: running.task, sessionFile: running.sessionFile, error: err?.message },
               },
               { triggerTurn: true, deliverAs: "steer" },
+              running.parentSessionFile,
             );
           });
 
@@ -2265,7 +2341,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         content: resolveResultPresentation(result, name),
         display: true,
         details: { name, task, exitCode: result.exitCode, elapsed: result.elapsed, sessionFile: result.sessionFile },
-      }, { triggerTurn: true, deliverAs: "steer" });
+      }, { triggerTurn: true, deliverAs: "steer" }, running.parentSessionFile);
     });
   };
 
@@ -2643,7 +2719,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               ...(result.sessionId ? { sessionId: result.sessionId } : {}),
               ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
             },
-          }, { triggerTurn: true, deliverAs: "steer" });
+          }, { triggerTurn: true, deliverAs: "steer" }, nativeRunning.parentSessionFile);
         });
         return {
           content: [{ type: "text", text: `Session "${name}" resumed.` }],
@@ -2694,7 +2770,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         if (parentSessionFile && switchSession) {
           const switched = await switchSession(parentSessionFile, {
             withSession: async (nextCtx) => {
-              bindActiveSessionSender(nextCtx.sendMessage.bind(nextCtx));
+              bindActiveSessionSender(nextCtx.sendMessage.bind(nextCtx), nextCtx.sessionManager.getSessionFile() ?? "");
               switchFocusedSession = (sessionFile, options) => nextCtx.switchSession(sessionFile, options);
               nextCtx.ui.notify("Focus returned to parent agent.", "info");
             },
@@ -2722,7 +2798,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       focusedSubagentId = match.id;
       const switched = await ctx.switchSession(match.sessionFile, {
         withSession: async (nextCtx) => {
-          bindActiveSessionSender(nextCtx.sendMessage.bind(nextCtx));
+          bindActiveSessionSender(nextCtx.sendMessage.bind(nextCtx), nextCtx.sessionManager.getSessionFile() ?? "");
           switchFocusedSession = (sessionFile, options) => nextCtx.switchSession(sessionFile, options);
           nextCtx.ui.notify(`Focused on ${match.name}. Use /subagent-focus parent to return.`, "info");
         },

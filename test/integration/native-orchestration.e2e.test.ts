@@ -189,8 +189,9 @@ describe("native subagent orchestration (E2E)", () => {
     extensionTestApi.sendToActiveSession(
       { customType: "subagent_result", content: "queued completion", display: true },
       { triggerTurn: true, deliverAs: "steer" },
+      join(cwd, "parent.jsonl"),
     );
-    extensionTestApi.bindActiveSessionSender(api.sendMessage.bind(api));
+    extensionTestApi.bindActiveSessionSender(api.sendMessage.bind(api), join(cwd, "parent.jsonl"));
     try {
       await new Promise((resolve) => setImmediate(resolve));
       assert.equal(completions[0]?.content, "queued completion");
